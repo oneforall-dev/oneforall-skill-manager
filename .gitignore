@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Local Test Repositories & Folders
+.agents/
+.gemini/
+.claude/
+.codex/
+
+# OS & Temporary Files
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.local
+recolor.py

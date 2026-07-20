@@ -1,0 +1,30 @@
+{
+  "name": "oneforall-skill-manager",
+  "version": "1.0.0",
+  "description": "Universal Automated Skill Installer & Manager for AI Agents (Claude Code, Antigravity, Open Design, Codex)",
+  "main": "installer.js",
+  "bin": {
+    "oneforall-skills": "installer.js"
+  },
+  "scripts": {
+    "start": "node installer.js",
+    "cli": "node installer.js --help"
+  },
+  "keywords": [
+    "ai-agents",
+    "claude-code",
+    "antigravity",
+    "codex",
+    "open-design",
+    "skill-installer",
+    "skill-manager",
+    "agent-skills"
+  ],
+  "author": "Oneforall Dev",
+  "license": "MIT",
+  "homepage": "https://oneforall.ocloud.click",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oneforall-dev/oneforall-skill-manager.git"
+  }
+}
