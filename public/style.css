@@ -1218,3 +1218,200 @@ input:checked + .slider:before {
   color: var(--primary-cyan);
 }
 
+/* ==========================================================================
+   Mobile & Responsive Enhancements
+   ========================================================================== */
+
+@media (max-width: 900px) {
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+    gap: 20px;
+  }
+  
+  .container {
+    padding: 20px 14px;
+    gap: 20px;
+  }
+
+  .app-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+
+  .app-tagline {
+    font-size: 11px;
+    letter-spacing: 1px;
+    padding: 4px 12px;
+  }
+}
+
+@media (max-width: 600px) {
+  .container {
+    padding: 14px 10px;
+    gap: 16px;
+  }
+
+  .app-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .logo-area {
+    gap: 8px;
+  }
+
+  .brand-header-logo {
+    width: 32px;
+    height: 32px;
+  }
+
+  .app-header h1 {
+    font-size: 20px;
+  }
+
+  .app-tagline {
+    font-size: 10.5px;
+    letter-spacing: 0.5px;
+    padding: 4px 10px;
+    align-self: flex-start;
+    max-width: 100%;
+    white-space: normal;
+    word-break: break-word;
+  }
+
+  .card {
+    padding: 16px 14px;
+    border-radius: 16px;
+    gap: 18px;
+  }
+
+  .card-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+
+  .card-header h2 {
+    font-size: 18px;
+  }
+
+  .header-actions {
+    width: 100%;
+  }
+
+  /* 2x2 equal grid for tabs on mobile screen */
+  .tab-filters {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+    width: 100%;
+  }
+
+  .tab-btn {
+    width: 100%;
+    flex: none;
+    font-size: 12px;
+    padding: 8px 4px;
+    height: 34px;
+  }
+
+  .target-header-row {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .toggle-switch-wrapper {
+    padding: 2px 8px;
+  }
+
+  .toggle-label-text {
+    font-size: 11.5px;
+  }
+
+  .checkbox-toggle label, .radio-toggle label {
+    padding: 10px 12px;
+    font-size: 13px;
+    gap: 8px;
+  }
+
+  .skill-card {
+    padding: 14px 12px;
+    gap: 10px;
+  }
+
+  .skill-title {
+    font-size: 15px;
+  }
+
+  .skill-meta {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  .type-tag {
+    align-self: flex-start;
+  }
+
+  .skill-actions {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .skill-path {
+    max-width: 100%;
+    font-size: 10px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .skill-buttons {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
+    gap: 6px;
+    width: 100%;
+  }
+
+  .action-btn {
+    justify-content: center;
+    padding: 8px 10px;
+    font-size: 11.5px;
+  }
+
+  .app-footer {
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 16px;
+    padding-top: 20px;
+    padding-bottom: 20px;
+  }
+
+  .footer-brand {
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .footer-links {
+    flex-direction: column;
+    width: 100%;
+    gap: 8px;
+  }
+
+  .footer-link {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .modal-content {
+    width: 95%;
+    max-height: 92vh;
+    padding: 16px;
+    border-radius: 16px;
+  }
+}
+
