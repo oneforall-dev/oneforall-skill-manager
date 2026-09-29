@@ -10,6 +10,8 @@ Persistent editorial-state service for the Oneforall Social Manager plugin.
 - scheduled/published timestamps
 - Social Publisher post IDs and published URLs
 - asset IDs, captions, Director project IDs and approval receipts
+- Google Calendar mapping per client
+- Google Calendar event IDs per content item
 - immutable status-change events
 
 ## Pipeline
@@ -34,7 +36,7 @@ and the number of content items that should be advanced toward readiness is:
 
 `buffer_target - future_inventory`.
 
-The orchestrator should first advance existing ideas and incomplete production before requesting net-new ideas from Oneforall Director.
+The orchestrator should first advance existing ideas and incomplete production before requesting net-new ideas.
 
 ## REST API
 
@@ -44,6 +46,10 @@ The orchestrator should first advance existing ideas and incomplete production b
 - `GET /api/content?client_slug=...&campaign=...&platform=...&status=...`
 - `POST /api/content`
 - `PATCH /api/content/:id/status`
+- `PATCH /api/content/:id/calendar-link`
+- `GET /api/calendars/:client`
+- `POST /api/calendars/register`
+- `POST /api/calendars/ensure`
 
 ## MCP endpoint
 
@@ -56,18 +62,61 @@ Exposed tools:
 - `create_content_item`
 - `transition_content_item`
 - `list_content_items`
+- `get_client_calendar`
+- `register_client_calendar`
+- `ensure_client_calendar`
+- `link_calendar_event`
+
+## Google Calendar architecture
+
+Google Calendar is the human-visible editorial planning layer; it is not the source of truth for whether a social post is actually scheduled or published.
+
+- Social Manager ledger owns content identity, lifecycle, buffer and mappings.
+- Google Calendar owns intended editorial dates and client-visible planning.
+- Social Publisher owns actual scheduled/published state.
+- Auditor owns creative approval evidence.
+
+The ChatGPT Google Calendar connector can list calendars and read/create/update/delete events in visible calendars. At the time this backend was authored, it does not expose a `create_calendar` action. For that missing capability, this backend can create one dedicated Google Calendar per client via the official Google Calendar API and persist the resulting calendar ID.
+
+Suggested calendar naming convention:
+
+`Social — <Client Name>`
+
+### Calendar creation OAuth
+
+To enable `ensure_client_calendar`, configure:
+
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_REFRESH_TOKEN`
+
+The refresh token must have Google Calendar write permission sufficient to create calendars. Do not commit credentials; configure them as Coolify environment secrets.
+
+If these variables are absent, normal Social Manager operations and Calendar event syncing through the connected ChatGPT Google Calendar capability can still work, but automatic creation of a brand-new secondary calendar will return `GOOGLE_OAUTH_NOT_CONFIGURED` rather than pretending success.
 
 ## Local setup
 
 1. Create a PostgreSQL database.
 2. Copy `.env.example` to `.env` and set `DATABASE_URL`.
-3. Run `npm install`.
-4. Run `npm run migrate`.
-5. Run `npm start`.
+3. Optionally configure the Google OAuth values above for calendar provisioning.
+4. Run `npm install`.
+5. Run `npm run migrate`.
+6. Run `npm start`.
 
 ## Production deployment
 
-The service is container-ready through `Dockerfile`. In Coolify, create a service from this directory, attach PostgreSQL, set `DATABASE_URL`, expose port `3000`, and configure an HTTPS domain. After deployment, the plugin can point its `mcp.json` to `https://YOUR-DOMAIN/mcp`.
+The service is container-ready through `Dockerfile`. In Coolify, create a service from this directory, attach PostgreSQL, set `DATABASE_URL`, expose port `3000`, and configure an HTTPS domain. Add Google OAuth secrets only if the service should be allowed to create secondary calendars. After deployment, the plugin can point its `mcp.json` to `https://YOUR-DOMAIN/mcp`.
+
+## Calendar sync workflow
+
+1. Social Manager resolves the client's mapped calendar.
+2. If no mapping exists, it first checks visible Google Calendars for a suitable existing client calendar.
+3. If a calendar is selected or created, its ID is persisted with `register_client_calendar` or `ensure_client_calendar`.
+4. Planned editorial slots may be created as transparent Google Calendar events and linked with `link_calendar_event`.
+5. A Calendar event alone does not move the content item to `scheduled`.
+6. When Social Publisher confirms scheduling, the ledger moves to `scheduled` and the Calendar event should be aligned to the confirmed Publisher timestamp.
+7. When Social Publisher confirms publication, the ledger moves to `published` and the Calendar event can be updated with published status and URL.
+8. If a user manually moves a Calendar event after Publisher scheduling, Social Manager should flag a mismatch; it must not silently alter the Publisher schedule.
 
 ## Social Publisher handoff
 
@@ -82,7 +131,8 @@ The Social Manager does not duplicate publishing logic. Its publication workflow
 
 ## Director / Auditor handoff
 
-- Director receives the highest-priority existing idea/brief first.
+- Existing suitable work is advanced before net-new ideas are requested.
+- Video production routes to Director; non-video strategy/creative planning routes to the appropriate content capability.
 - Produced assets move to `audit`.
 - Auditor PASS moves the exact version to `approved` with its approval receipt.
 - Auditor FAIL moves it to `needs_revision`, preserving the feedback in metadata.
