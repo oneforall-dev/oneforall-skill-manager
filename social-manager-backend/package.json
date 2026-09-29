@@ -1,0 +1,21 @@
+{
+  "name": "oneforall-social-manager-backend",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Persistent editorial pipeline and MCP backend for Oneforall Social Manager.",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "migrate": "psql \"$DATABASE_URL\" -f migrations/001_init.sql"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "express": "^5.0.0",
+    "pg": "^8.13.0",
+    "zod": "^3.23.0"
+  }
+}
