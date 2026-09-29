@@ -2,7 +2,7 @@ import express from 'express';
 import pg from 'pg';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/server';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/node';
+import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
 import { createMcpExpressApp } from '@modelcontextprotocol/express';
 
 const { Pool } = pg;
@@ -150,23 +150,34 @@ function toolResult(value) { return { content: [{ type: 'text', text: JSON.strin
 
 function buildMcpServer() {
   const server = new McpServer({ name: 'oneforall-social-manager', version: '0.2.0' });
-  server.tool('get_social_dashboard','Get pipeline counts, weekly plan, future inventory and replenishment requirement',{
-    client_slug:z.string(), campaign:z.string().default('default'), platform:z.string().default('instagram')
+  server.registerTool('get_social_dashboard',{
+    description:'Get pipeline counts, weekly plan, future inventory and replenishment requirement',
+    inputSchema:{client_slug:z.string(), campaign:z.string().default('default'), platform:z.string().default('instagram')}
   },async ({client_slug,campaign,platform}) => toolResult(await dashboard(client_slug,campaign,platform)));
-  server.tool('set_social_plan','Create or update weekly publication plan and buffer thresholds',{
-    client_slug:z.string(), campaign:z.string().default('default'), platform:z.string().default('instagram'),
-    posts_per_week:z.number().int().positive(), buffer_min:z.number().int().nonnegative(), buffer_target:z.number().int().nonnegative(),
-    format_mix:z.record(z.any()).optional(), pillar_mix:z.record(z.any()).optional(), preferred_slots:z.array(z.any()).optional(), active:z.boolean().optional()
+  server.registerTool('set_social_plan',{
+    description:'Create or update weekly publication plan and buffer thresholds',
+    inputSchema:{
+      client_slug:z.string(), campaign:z.string().default('default'), platform:z.string().default('instagram'),
+      posts_per_week:z.number().int().positive(), buffer_min:z.number().int().nonnegative(), buffer_target:z.number().int().nonnegative(),
+      format_mix:z.record(z.any()).optional(), pillar_mix:z.record(z.any()).optional(), preferred_slots:z.array(z.any()).optional(), active:z.boolean().optional()
+    }
   },async input => toolResult(await upsertPlan(input)));
-  server.tool('create_content_item','Register an idea or production item in the persistent editorial pipeline',{
-    client_slug:z.string(),campaign:z.string().default('default'),platform:z.string().default('instagram'),
-    format:z.enum(['image','carousel','reel','story','other']),title:z.string(),pillar:z.string().optional(),idea:z.string().optional(),hook:z.string().optional(),objective:z.string().optional(),cta:z.string().optional(),status:z.enum(STATUSES).optional(),priority:z.number().int().min(0).max(100).optional(),caption:z.string().optional(),asset_ids:z.array(z.string()).optional(),director_project_id:z.string().optional(),metadata:z.record(z.any()).optional()
+  server.registerTool('create_content_item',{
+    description:'Register an idea or production item in the persistent editorial pipeline',
+    inputSchema:{
+      client_slug:z.string(),campaign:z.string().default('default'),platform:z.string().default('instagram'),
+      format:z.enum(['image','carousel','reel','story','other']),title:z.string(),pillar:z.string().optional(),idea:z.string().optional(),hook:z.string().optional(),objective:z.string().optional(),cta:z.string().optional(),status:z.enum(STATUSES).optional(),priority:z.number().int().min(0).max(100).optional(),caption:z.string().optional(),asset_ids:z.array(z.string()).optional(),director_project_id:z.string().optional(),metadata:z.record(z.any()).optional()
+    }
   },async input => toolResult(await createContent(input)));
-  server.tool('transition_content_item','Change a content item state and record an immutable event',{
-    content_id:z.string().uuid(),status:z.enum(STATUSES),actor:z.string().optional(),scheduled_at:z.string().optional(),published_at:z.string().optional(),publisher_post_id:z.string().optional(),published_url:z.string().optional(),asset_ids:z.array(z.string()).optional(),caption:z.string().optional(),approval_receipt:z.record(z.any()).optional(),metadata:z.record(z.any()).optional()
+  server.registerTool('transition_content_item',{
+    description:'Change a content item state and record an immutable event',
+    inputSchema:{
+      content_id:z.string().uuid(),status:z.enum(STATUSES),actor:z.string().optional(),scheduled_at:z.string().optional(),published_at:z.string().optional(),publisher_post_id:z.string().optional(),published_url:z.string().optional(),asset_ids:z.array(z.string()).optional(),caption:z.string().optional(),approval_receipt:z.record(z.any()).optional(),metadata:z.record(z.any()).optional()
+    }
   },async ({content_id,status,actor,...patch}) => toolResult(await transitionContent(content_id,status,actor,patch)));
-  server.tool('list_content_items','List persistent content items by client and optional pipeline filters',{
-    client_slug:z.string(),campaign:z.string().optional(),platform:z.string().optional(),status:z.enum(STATUSES).optional(),limit:z.number().int().min(1).max(500).default(100)
+  server.registerTool('list_content_items',{
+    description:'List persistent content items by client and optional pipeline filters',
+    inputSchema:{client_slug:z.string(),campaign:z.string().optional(),platform:z.string().optional(),status:z.enum(STATUSES).optional(),limit:z.number().int().min(1).max(500).default(100)}
   },async ({client_slug,campaign,platform,status,limit}) => {
     const where=['client_slug=$1']; const args=[client_slug];
     for (const [key,value] of [['campaign',campaign],['platform',platform],['status',status]]) if(value){args.push(value);where.push(`${key}=$${args.length}`)}
@@ -178,7 +189,7 @@ function buildMcpServer() {
 
 app.post('/mcp', async (req,res) => {
   const server = buildMcpServer();
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on('close', () => { transport.close(); server.close(); });
   await server.connect(transport);
   await transport.handleRequest(req,res,req.body);
