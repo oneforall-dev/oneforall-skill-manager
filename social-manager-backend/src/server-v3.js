@@ -14,7 +14,14 @@ const STATUSES = [
   'approved','scheduled','published','blocked','failed'
 ];
 
-const app = createMcpExpressApp ? createMcpExpressApp() : express();
+const app = createMcpExpressApp ? createMcpExpressApp({
+  host: '0.0.0.0',
+  allowedHosts: [
+    'social-manager.ocloud.click',
+    'www.social-manager.ocloud.click',
+    'ew1x2xznx26o7ja8s3dxjqn4.181.215.135.132.sslip.io'
+  ]
+}) : express();
 app.use(express.json({ limit: '2mb' }));
 
 async function query(text, params = []) {
