@@ -2,7 +2,7 @@ import express from 'express';
 import pg from 'pg';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/server';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/node';
+import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
 import { createMcpExpressApp } from '@modelcontextprotocol/express';
 
 const { Pool } = pg;
@@ -263,27 +263,27 @@ app.post('/api/calendars/ensure', async (req,res) => {
 function toolResult(value) { return { content: [{ type: 'text', text: JSON.stringify(value) }] }; }
 
 function buildMcpServer() {
-  const server = new McpServer({ name: 'oneforall-social-manager', version: VERSION });
-  server.tool('get_social_dashboard','Get pipeline counts, plan, future inventory, client calendar mapping and replenishment requirement',{
+  const server = new McpServer({ name: 'oneforall-social-manager', version: VERSION });       const tool = (name, description, inputSchema, handler) => server.registerTool(name, { description, inputSchema }, handler);   
+  tool('get_social_dashboard','Get pipeline counts, plan, future inventory, client calendar mapping and replenishment requirement',{
     client_slug:z.string(), campaign:z.string().default('default'), platform:z.string().default('instagram')
   },async ({client_slug,campaign,platform}) => toolResult(await dashboard(client_slug,campaign,platform)));
 
-  server.tool('set_social_plan','Create or update weekly publication plan and buffer thresholds',{
+  tool('set_social_plan','Create or update weekly publication plan and buffer thresholds',{
     client_slug:z.string(), campaign:z.string().default('default'), platform:z.string().default('instagram'),
     posts_per_week:z.number().int().positive(), buffer_min:z.number().int().nonnegative(), buffer_target:z.number().int().nonnegative(),
     format_mix:z.record(z.any()).optional(), pillar_mix:z.record(z.any()).optional(), preferred_slots:z.array(z.any()).optional(), active:z.boolean().optional()
   },async input => toolResult(await upsertPlan(input)));
 
-  server.tool('create_content_item','Register an idea or production item in the persistent editorial pipeline',{
+  tool('create_content_item','Register an idea or production item in the persistent editorial pipeline',{
     client_slug:z.string(),campaign:z.string().default('default'),platform:z.string().default('instagram'),
     format:z.enum(['image','carousel','reel','story','other']),title:z.string(),pillar:z.string().optional(),idea:z.string().optional(),hook:z.string().optional(),objective:z.string().optional(),cta:z.string().optional(),status:z.enum(STATUSES).optional(),priority:z.number().int().min(0).max(100).optional(),caption:z.string().optional(),asset_ids:z.array(z.string()).optional(),director_project_id:z.string().optional(),google_calendar_id:z.string().optional(),google_calendar_event_id:z.string().optional(),calendar_sync_status:z.string().optional(),metadata:z.record(z.any()).optional()
   },async input => toolResult(await createContent(input)));
 
-  server.tool('transition_content_item','Change a content item state and record an immutable event',{
+  tool('transition_content_item','Change a content item state and record an immutable event',{
     content_id:z.string().uuid(),status:z.enum(STATUSES),actor:z.string().optional(),scheduled_at:z.string().optional(),published_at:z.string().optional(),publisher_post_id:z.string().optional(),published_url:z.string().optional(),asset_ids:z.array(z.string()).optional(),caption:z.string().optional(),approval_receipt:z.record(z.any()).optional(),google_calendar_id:z.string().optional(),google_calendar_event_id:z.string().optional(),calendar_sync_status:z.string().optional(),metadata:z.record(z.any()).optional()
   },async ({content_id,status,actor,...patch}) => toolResult(await transitionContent(content_id,status,actor,patch)));
 
-  server.tool('list_content_items','List persistent content items by client and optional pipeline filters',{
+  tool('list_content_items','List persistent content items by client and optional pipeline filters',{
     client_slug:z.string(),campaign:z.string().optional(),platform:z.string().optional(),status:z.enum(STATUSES).optional(),limit:z.number().int().min(1).max(500).default(100)
   },async ({client_slug,campaign,platform,status,limit}) => {
     const where=['client_slug=$1']; const args=[client_slug];
@@ -292,19 +292,19 @@ function buildMcpServer() {
     return toolResult(await query(`SELECT * FROM content_items WHERE ${where.join(' AND ')} ORDER BY COALESCE(scheduled_at,created_at) ASC LIMIT $${args.length}`,args));
   });
 
-  server.tool('get_client_calendar','Get the Google Calendar mapped to a Social Manager client',{
+  tool('get_client_calendar','Get the Google Calendar mapped to a Social Manager client',{
     client_slug:z.string()
   },async ({client_slug}) => toolResult({calendar:await getClientCalendar(client_slug)}));
 
-  server.tool('register_client_calendar','Store a Google Calendar ID already created or selected through the connected Google Calendar capability',{
+  tool('register_client_calendar','Store a Google Calendar ID already created or selected through the connected Google Calendar capability',{
     client_slug:z.string(),google_calendar_id:z.string(),calendar_name:z.string(),timezone:z.string().default('America/Bogota'),source:z.string().default('google-calendar')
   },async input => toolResult(await storeClientCalendar(input)));
 
-  server.tool('ensure_client_calendar','Create and persist one Google Calendar for a client when no mapping exists. Requires Google OAuth environment credentials on the backend.',{
+  tool('ensure_client_calendar','Create and persist one Google Calendar for a client when no mapping exists. Requires Google OAuth environment credentials on the backend.',{
     client_slug:z.string(),calendar_name:z.string().optional(),timezone:z.string().default('America/Bogota'),description:z.string().optional(),force_new:z.boolean().default(false)
   },async input => toolResult(await ensureClientCalendar(input)));
 
-  server.tool('link_calendar_event','Link a Google Calendar event to one persistent content item',{
+  tool('link_calendar_event','Link a Google Calendar event to one persistent content item',{
     content_id:z.string().uuid(),google_calendar_id:z.string(),google_calendar_event_id:z.string(),calendar_sync_status:z.string().default('linked'),actor:z.string().default('social-manager')
   },async ({content_id,...input}) => toolResult(await linkCalendarEvent(content_id,input)));
 
@@ -313,7 +313,7 @@ function buildMcpServer() {
 
 app.post('/mcp', async (req,res) => {
   const server = buildMcpServer();
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on('close', () => { transport.close(); server.close(); });
   await server.connect(transport);
   await transport.handleRequest(req,res,req.body);
