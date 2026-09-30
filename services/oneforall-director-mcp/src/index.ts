@@ -1,0 +1,435 @@
+import "dotenv/config";
+import { createMcpExpressApp } from "@modelcontextprotocol/express";
+import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
+import { McpServer } from "@modelcontextprotocol/server";
+import * as z from "zod/v4";
+import { director } from "./director-api.js";
+import { configureOAuth, requireOAuth } from "./oauth.js";
+
+const allowedHosts = (
+  process.env.MCP_ALLOWED_HOSTS ||
+  "director.oneforall.ocloud.click,www.director.oneforall.ocloud.click,localhost,127.0.0.1"
+)
+  .split(",")
+  .map((host) => host.trim())
+  .filter(Boolean);
+
+const app = createMcpExpressApp({
+  host: "0.0.0.0",
+  allowedHosts,
+});
+const port = Number(process.env.PORT || 3000);
+const wrappedOutputSchema = z.object({ data: z.unknown() });
+
+configureOAuth(app);
+
+function textResult(data: unknown) {
+  return {
+    structuredContent: { data },
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(data, null, 2),
+      },
+    ],
+  };
+}
+
+function errorResult(error: unknown) {
+  return {
+    isError: true,
+    content: [
+      {
+        type: "text" as const,
+        text: error instanceof Error ? error.message : String(error),
+      },
+    ],
+  };
+}
+
+function buildServer() {
+  const server = new McpServer(
+    {
+      name: "oneforall-director",
+      version: "1.0.0",
+    },
+    {
+      instructions:
+        "Tools for Oneforall Director creative ownership and video production. Manage persistent content items, versions, specialist calls, results and Auditor handoffs, plus create, inspect, analyze, plan, render and revise video projects. Preserve ITEM_ID and never claim another agent executed work without a recorded result.",
+    }
+  );
+
+  server.registerTool(
+    "list_projects",
+    {
+      title: "List projects",
+      description: "List active Oneforall Director video projects.",
+      inputSchema: z.object({}),
+      outputSchema: wrappedOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+    },
+    async () => {
+      try {
+        return textResult(await director.listProjects());
+      } catch (e) {
+        return errorResult(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "create_project",
+    {
+      title: "Create project",
+      description:
+        "Create a new Oneforall Director video project. sourceUrl is optional according to the existing OpenAPI schema.",
+      inputSchema: z.object({
+        name: z.string().min(1).describe("Project name"),
+        sourceUrl: z
+          .string()
+          .optional()
+          .describe("Optional source video URL or source filename"),
+      }),
+      outputSchema: wrappedOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ name, sourceUrl }) => {
+      try {
+        return textResult(
+          await director.createProject({
+            name,
+            ...(sourceUrl ? { sourceUrl } : {}),
+          })
+        );
+      } catch (e) {
+        return errorResult(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "get_project",
+    {
+      title: "Get project",
+      description:
+        "Get project details, metadata, transcript, edit plan, silences, versions, and feedback.",
+      inputSchema: z.object({
+        project_id: z.string().min(1),
+      }),
+      outputSchema: wrappedOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ project_id }) => {
+      try {
+        return textResult(await director.getProject(project_id));
+      } catch (e) {
+        return errorResult(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "analyze_project",
+    {
+      title: "Analyze project",
+      description:
+        "Analyze a video project: extract audio, detect silences, transcribe speech, and return analysis metadata.",
+      inputSchema: z.object({
+        project_id: z.string().min(1),
+      }),
+      outputSchema: wrappedOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ project_id }) => {
+      try {
+        return textResult(await director.analyzeProject(project_id));
+      } catch (e) {
+        return errorResult(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "generate_edit_plan",
+    {
+      title: "Generate edit plan",
+      description:
+        "Generate the Director edit plan for a project, including cuts, captions, visuals, and audio.",
+      inputSchema: z.object({
+        project_id: z.string().min(1),
+      }),
+      outputSchema: wrappedOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ project_id }) => {
+      try {
+        return textResult(await director.generateEditPlan(project_id));
+      } catch (e) {
+        return errorResult(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "render_video_version",
+    {
+      title: "Render video version",
+      description:
+        "Render a new video version using the project's current edit plan.",
+      inputSchema: z.object({
+        project_id: z.string().min(1),
+      }),
+      outputSchema: wrappedOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ project_id }) => {
+      try {
+        return textResult(await director.renderVideoVersion(project_id));
+      } catch (e) {
+        return errorResult(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "revise_video_version",
+    {
+      title: "Revise video version",
+      description:
+        "Ask Director to process the project's existing feedback notes and render an updated version. The supplied OpenAPI does not define a request body for this endpoint, so this tool intentionally only accepts project_id.",
+      inputSchema: z.object({
+        project_id: z.string().min(1),
+      }),
+      outputSchema: wrappedOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ project_id }) => {
+      try {
+        return textResult(await director.reviseVideoVersion(project_id));
+      } catch (e) {
+        return errorResult(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "list_content_items",
+    {
+      title: "List content items",
+      description: "List persistent Oneforall creative content items, optionally filtered by CLIENT_ID.",
+      inputSchema: z.object({ client_id: z.string().min(1).optional() }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ client_id }) => {
+      try { return textResult(await director.listContentItems(client_id)); } catch (e) { return errorResult(e); }
+    }
+  );
+
+  server.registerTool(
+    "create_content_item",
+    {
+      title: "Create content item",
+      description: "Create a persistent creative ITEM_ID for a Reel, carousel, Story, static post, ad, UGC, cinematic, music, lore, thumbnail, cover, graphic, or other format. Fails rather than duplicating an existing ITEM_ID.",
+      inputSchema: z.object({
+        item_id: z.string().min(1).max(120).regex(/^[a-zA-Z0-9_-]+$/),
+        client_id: z.string().min(1).max(120),
+        title: z.string().min(1).max(200),
+        format: z.string().min(1).max(80),
+        objective: z.string().max(4000).optional(),
+        context: z.string().max(12000).optional(),
+        locked_elements: z.array(z.string().min(1).max(500)).max(100).default([]),
+      }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ item_id, client_id, title, format, objective, context, locked_elements }) => {
+      try {
+        return textResult(await director.createContentItem({ itemId: item_id, clientId: client_id, title, format, objective, context, lockedElements: locked_elements }));
+      } catch (e) { return errorResult(e); }
+    }
+  );
+
+  server.registerTool(
+    "get_content_item",
+    {
+      title: "Get content item",
+      description: "Get the verified persistent state of an ITEM_ID, including versions, locked elements, specialist calls and handoffs.",
+      inputSchema: z.object({ item_id: z.string().min(1) }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ item_id }) => {
+      try { return textResult(await director.getContentItem(item_id)); } catch (e) { return errorResult(e); }
+    }
+  );
+
+  server.registerTool(
+    "update_content_item",
+    {
+      title: "Update content item",
+      description: "Update mutable metadata or workflow status for an existing ITEM_ID without creating a duplicate.",
+      inputSchema: z.object({
+        item_id: z.string().min(1),
+        title: z.string().min(1).max(200).optional(),
+        format: z.string().min(1).max(80).optional(),
+        objective: z.string().max(4000).optional(),
+        context: z.string().max(12000).optional(),
+        status: z.enum(["DRAFT", "IN_PRODUCTION", "READY_FOR_AUDIT", "APPROVED", "CORRECTION_REQUIRED", "REJECTED", "FAILED", "SUPERSEDED", "DO_NOT_PUBLISH"]).optional(),
+        locked_elements: z.array(z.string().min(1).max(500)).max(100).optional(),
+      }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ item_id, locked_elements, ...changes }) => {
+      try {
+        const input: Record<string, unknown> = { ...changes };
+        if (locked_elements) input.lockedElements = locked_elements;
+        return textResult(await director.updateContentItem(item_id, input));
+      } catch (e) { return errorResult(e); }
+    }
+  );
+
+  server.registerTool(
+    "create_content_version",
+    {
+      title: "Create content version",
+      description: "Append an immutable, traceable creative version to an existing ITEM_ID and advance its workflow status.",
+      inputSchema: z.object({
+        item_id: z.string().min(1),
+        summary: z.string().min(1).max(4000),
+        package: z.record(z.string(), z.unknown()).describe("Structured creative package for this version"),
+        created_by: z.string().min(1).max(120).default("Oneforall Director"),
+        status: z.enum(["DRAFT", "IN_PRODUCTION", "READY_FOR_AUDIT", "APPROVED", "CORRECTION_REQUIRED", "REJECTED", "FAILED", "SUPERSEDED", "DO_NOT_PUBLISH"]).default("IN_PRODUCTION"),
+      }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ item_id, summary, package: creativePackage, created_by, status }) => {
+      try { return textResult(await director.createContentVersion(item_id, { summary, package: creativePackage, createdBy: created_by, status })); } catch (e) { return errorResult(e); }
+    }
+  );
+
+  server.registerTool(
+    "create_specialist_call",
+    {
+      title: "Create specialist call",
+      description: "Record a specialist request without transferring creative ownership of the ITEM_ID. The result must return to Oneforall Director.",
+      inputSchema: z.object({
+        item_id: z.string().min(1),
+        specialist: z.string().min(1).max(160),
+        action: z.string().min(1).max(160),
+        task: z.string().min(1).max(6000),
+        context: z.string().max(12000).optional(),
+        locked_elements: z.array(z.string().min(1).max(500)).max(100).default([]),
+        expected_output: z.string().min(1).max(6000),
+        content_version: z.number().int().positive().optional(),
+      }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ item_id, specialist, action, task, context, locked_elements, expected_output, content_version }) => {
+      try { return textResult(await director.createSpecialistCall(item_id, { specialist, action, task, context, lockedElements: locked_elements, expectedOutput: expected_output, returnTo: "@Oneforall Director", contentVersion: content_version })); } catch (e) { return errorResult(e); }
+    }
+  );
+
+  server.registerTool(
+    "submit_specialist_result",
+    {
+      title: "Submit specialist result",
+      description: "Record the result of a specialist call and return it to the creative owner for integration.",
+      inputSchema: z.object({ item_id: z.string().min(1), call_id: z.string().uuid(), result: z.record(z.string(), z.unknown()) }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ item_id, call_id, result }) => {
+      try { return textResult(await director.submitSpecialistResult(item_id, { callId: call_id, result })); } catch (e) { return errorResult(e); }
+    }
+  );
+
+  server.registerTool(
+    "handoff_content_item",
+    {
+      title: "Handoff content item",
+      description: "Record an owner handoff for an exact ITEM_ID and CONTENT_VERSION. Handoffs to Auditor move the item to READY_FOR_AUDIT but never claim approval.",
+      inputSchema: z.object({
+        item_id: z.string().min(1),
+        target_nick: z.string().min(1).max(160),
+        target_plugin: z.string().min(1).max(200),
+        action: z.string().min(1).max(160),
+        context: z.string().max(12000),
+        expected_output: z.string().min(1).max(6000),
+        return_to: z.string().max(200).optional(),
+        attempt: z.number().int().positive().default(1),
+        approval_receipt: z.string().max(1000).optional(),
+        dependencies: z.array(z.string().min(1).max(500)).max(100).default([]),
+        content_version: z.number().int().positive().optional(),
+      }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ item_id, target_nick, target_plugin, action, context, expected_output, return_to, attempt, approval_receipt, dependencies, content_version }) => {
+      try { return textResult(await director.handoffContentItem(item_id, { targetNick: target_nick, targetPlugin: target_plugin, action, context, expectedOutput: expected_output, returnTo: return_to, attempt, approvalReceipt: approval_receipt, dependencies, contentVersion: content_version })); } catch (e) { return errorResult(e); }
+    }
+  );
+
+  return server;
+}
+
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "oneforall-director-mcp",
+  });
+});
+
+app.post("/mcp", requireOAuth, async (req, res) => {
+  // Stateless Streamable HTTP is simplest for an API-style adapter.
+  // One transport + one McpServer per request avoids request/session collisions.
+  const server = buildServer();
+  const transport = new NodeStreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true,
+  });
+
+  res.on("close", () => {
+    transport.close().catch(() => {});
+  });
+
+  await server.connect(transport);
+  await transport.handleRequest(req, res, req.body);
+});
+
+app.listen(port, "0.0.0.0", () => {
+  console.log(`Oneforall Director MCP listening on port ${port}`);
+  console.log(`Health: http://localhost:${port}/health`);
+  console.log(`MCP:    http://localhost:${port}/mcp`);
+});
