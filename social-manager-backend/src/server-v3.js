@@ -9,7 +9,7 @@ import { createRemoteJWKSet, jwtVerify } from 'jose';
 const { Pool } = pg;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-const VERSION = '0.6.0';
+const VERSION = '0.6.1';
 const AUTH_ENABLED = /^(1|true|yes)$/i.test(process.env.AUTH_ENABLED ?? 'false');
 const AUTH_ISSUER = process.env.AUTH_ISSUER;
 const AUTH_AUDIENCE = process.env.AUTH_AUDIENCE;
@@ -46,6 +46,20 @@ function unauthorized(res, requiredScopes, error, description) {
   const challenge = authChallenge(requiredScopes, error, description);
   res.set('WWW-Authenticate', challenge);
   return res.status(401).json({ error, error_description: description });
+}
+
+function authDiagnostics() {
+  return {
+    enabled: AUTH_ENABLED,
+    configured: Boolean(AUTH_ISSUER && AUTH_AUDIENCE && AUTH_JWKS_URI && ALLOWED_EMAILS.size),
+    resource: MCP_RESOURCE_URL,
+    issuer_configured: Boolean(AUTH_ISSUER),
+    audience_configured: Boolean(AUTH_AUDIENCE),
+    jwks_configured: Boolean(AUTH_JWKS_URI),
+    email_claim: AUTH_EMAIL_CLAIM,
+    allowed_email_count: ALLOWED_EMAILS.size,
+    scopes_supported: OAUTH_SCOPES
+  };
 }
 
 function validateAuthConfiguration() {
@@ -86,11 +100,19 @@ async function authenticateRequest(req, res, next) {
     return next();
   }
   const match = req.get('authorization')?.match(/^Bearer\s+(.+)$/i);
-  if (!match) return unauthorized(res, [], 'invalid_token', 'A valid OAuth access token is required');
+  if (!match) {
+    console.warn('OAuth authentication failed', { path: req.path, code: 'missing_bearer', message: 'Authorization Bearer token not provided' });
+    return unauthorized(res, [], 'invalid_token', 'A valid OAuth access token is required');
+  }
   try {
     req.auth = await verifyAccessToken(match[1]);
     return next();
   } catch (error) {
+    console.warn('OAuth authentication failed', {
+      path: req.path,
+      code: error.code ?? error.name ?? 'invalid_token',
+      message: error.message
+    });
     const description = error.code === 'account_not_allowed'
       ? error.message
       : 'The OAuth access token is invalid or expired';
@@ -219,142 +241,103 @@ async function transitionContent(id, toStatus, actor='social-manager', patch={})
       asset_ids=COALESCE($7::jsonb,asset_ids),
       caption=COALESCE($8,caption),
       approval_receipt=COALESCE($9::jsonb,approval_receipt),
-      metadata=metadata || COALESCE($10::jsonb,'{}'::jsonb),
-      google_calendar_id=COALESCE($11,google_calendar_id),
-      google_calendar_event_id=COALESCE($12,google_calendar_event_id),
-      calendar_sync_status=COALESCE($13,calendar_sync_status),
+      google_calendar_id=COALESCE($10,google_calendar_id),
+      google_calendar_event_id=COALESCE($11,google_calendar_event_id),
+      calendar_sync_status=COALESCE($12,calendar_sync_status),
+      metadata=COALESCE(metadata,'{}'::jsonb) || COALESCE($13::jsonb,'{}'::jsonb),
       updated_at=now()
     WHERE id=$1 RETURNING *
-  `,[id,toStatus,patch.scheduled_at ?? null,patch.published_at ?? null,patch.publisher_post_id ?? null,
-     patch.published_url ?? null,patch.asset_ids ? JSON.stringify(patch.asset_ids) : null,patch.caption ?? null,
-     patch.approval_receipt ? JSON.stringify(patch.approval_receipt) : null,JSON.stringify(patch.metadata ?? {}),
-     patch.google_calendar_id ?? null,patch.google_calendar_event_id ?? null,patch.calendar_sync_status ?? null]);
-  await query(`INSERT INTO content_events(content_id,event_type,from_status,to_status,actor,payload) VALUES($1,'status_changed',$2,$3,$4,$5::jsonb)`,
+  `,[id,toStatus,patch.scheduled_at ?? null,patch.published_at ?? null,patch.publisher_post_id ?? null,patch.published_url ?? null,
+      patch.asset_ids ? JSON.stringify(patch.asset_ids) : null,patch.caption ?? null,
+      patch.approval_receipt ? JSON.stringify(patch.approval_receipt) : null,
+      patch.google_calendar_id ?? null,patch.google_calendar_event_id ?? null,patch.calendar_sync_status ?? null,
+      patch.metadata ? JSON.stringify(patch.metadata) : null]);
+  await query(`INSERT INTO content_events(content_id,event_type,from_status,to_status,actor,payload) VALUES($1,'transition',$2,$3,$4,$5::jsonb)`,
     [id,current.status,toStatus,actor,JSON.stringify(patch)]);
   return rows[0];
 }
 
-async function linkCalendarEvent(contentId, input) {
-  const current = (await query('SELECT * FROM content_items WHERE id=$1',[contentId]))[0];
-  if (!current) throw new Error('Content item not found');
-  const rows = await query(`
-    UPDATE content_items SET
-      google_calendar_id=$2,
-      google_calendar_event_id=$3,
-      calendar_sync_status=$4,
-      updated_at=now()
-    WHERE id=$1 RETURNING *
-  `,[contentId,input.google_calendar_id,input.google_calendar_event_id,input.calendar_sync_status ?? 'linked']);
-  await query(`INSERT INTO content_events(content_id,event_type,from_status,to_status,actor,payload)
-               VALUES($1,'calendar_linked',$2,$2,$3,$4::jsonb)`,
-    [contentId,current.status,input.actor ?? 'social-manager',JSON.stringify(input)]);
-  return rows[0];
+async function dashboard(clientSlug,campaign='default',platform='instagram') {
+  const plan = (await query('SELECT * FROM social_plans WHERE client_slug=$1 AND campaign=$2 AND platform=$3',[clientSlug,campaign,platform]))[0] ?? null;
+  const counts = Object.fromEntries(STATUSES.map(s => [s,0]));
+  for (const row of await query('SELECT status,count(*)::int AS count FROM content_items WHERE client_slug=$1 AND campaign=$2 AND platform=$3 GROUP BY status',[clientSlug,campaign,platform])) counts[row.status]=row.count;
+  const future = (await query(`SELECT count(*)::int AS count FROM content_items WHERE client_slug=$1 AND campaign=$2 AND platform=$3 AND status IN ('approved','scheduled') AND (scheduled_at IS NULL OR scheduled_at>now())`,[clientSlug,campaign,platform]))[0]?.count ?? 0;
+  const published7d = (await query(`SELECT count(*)::int AS count FROM content_items WHERE client_slug=$1 AND campaign=$2 AND platform=$3 AND status='published' AND published_at>=now()-interval '7 days'`,[clientSlug,campaign,platform]))[0]?.count ?? 0;
+  const calendar = await getClientCalendar(clientSlug);
+  return {
+    client_slug:clientSlug,campaign,platform,plan,calendar,counts,future_inventory:future,
+    published_last_7_days:published7d,
+    replenish:!!plan && future < plan.buffer_min,
+    replenish_count:!!plan ? Math.max(plan.buffer_target - future,0) : null
+  };
 }
 
 async function saveDiscoverySet(input) {
-  const content = (await query('SELECT * FROM content_items WHERE id=$1',[input.content_id]))[0];
+  const content = (await query('SELECT id,client_slug,campaign,platform,status FROM content_items WHERE id=$1',[input.content_id]))[0];
   if (!content) throw new Error('Content item not found');
-  const requiredLayers = ['world_lore','artist_entity','genre_niche','post_context'];
-  for (const layer of requiredLayers) {
-    if (!Array.isArray(input.layers?.[layer]) || input.layers[layer].length === 0) {
-      throw new Error(`Discovery layer ${layer} must contain at least one term`);
-    }
-  }
-  const terms = [...new Set((input.terms ?? []).map(term => String(term).trim()).filter(Boolean))];
-  if (terms.length === 0) throw new Error('Discovery terms cannot be empty');
-  if (!Array.isArray(input.evidence) || input.evidence.length === 0) {
-    throw new Error('Current research evidence is required; do not save unsupported discovery sets');
-  }
-  const version = input.version ?? (await query(
-    'SELECT COALESCE(max(version),0)::int + 1 AS version FROM discovery_sets WHERE content_id=$1',
-    [input.content_id]
-  ))[0].version;
-  const status = input.status ?? 'draft';
-  if (status === 'selected') {
-    await query("UPDATE discovery_sets SET status='retired',updated_at=now() WHERE content_id=$1 AND status='selected'",[input.content_id]);
-  }
+  const version = input.version ?? ((await query('SELECT COALESCE(MAX(version),0)::int + 1 AS version FROM discovery_sets WHERE content_id=$1',[input.content_id]))[0].version);
   const rows = await query(`
     INSERT INTO discovery_sets
-      (content_id,version,status,language,layers,terms,rationale,evidence,hypothesis,researched_at,selected_at)
-    VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8::jsonb,$9,$10,$11)
+      (content_id,version,status,language,layers,terms,rationale,evidence,hypothesis,researched_at,selected_at,updated_at)
+    VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8::jsonb,$9,$10,
+      CASE WHEN $3='selected' THEN now() ELSE NULL END,now())
     ON CONFLICT (content_id,version) DO UPDATE SET
-      status=EXCLUDED.status,
-      language=EXCLUDED.language,
-      layers=EXCLUDED.layers,
-      terms=EXCLUDED.terms,
-      rationale=EXCLUDED.rationale,
-      evidence=EXCLUDED.evidence,
-      hypothesis=EXCLUDED.hypothesis,
-      researched_at=EXCLUDED.researched_at,
-      selected_at=EXCLUDED.selected_at,
+      status=EXCLUDED.status,language=EXCLUDED.language,layers=EXCLUDED.layers,terms=EXCLUDED.terms,
+      rationale=EXCLUDED.rationale,evidence=EXCLUDED.evidence,hypothesis=EXCLUDED.hypothesis,
+      researched_at=EXCLUDED.researched_at,selected_at=CASE WHEN EXCLUDED.status='selected' THEN now() ELSE discovery_sets.selected_at END,
       updated_at=now()
     RETURNING *
-  `,[input.content_id,version,status,input.language ?? 'en',JSON.stringify(input.layers),JSON.stringify(terms),
-     input.rationale ?? null,JSON.stringify(input.evidence),input.hypothesis ?? null,input.researched_at,
-     status === 'selected' ? new Date().toISOString() : null]);
-  await query(`INSERT INTO content_events(content_id,event_type,from_status,to_status,actor,payload)
-               VALUES($1,'discovery_set_saved',$2,$2,$3,$4::jsonb)`,
-    [input.content_id,content.status,input.actor ?? 'social-manager',JSON.stringify({discovery_set_id:rows[0].id,version,status})]);
+  `,[input.content_id,version,input.status ?? 'draft',input.language ?? 'en',JSON.stringify(input.layers),JSON.stringify(input.terms),
+      input.rationale ?? null,JSON.stringify(input.evidence),input.hypothesis ?? null,input.researched_at]);
   return rows[0];
 }
 
-async function listDiscoverySets({content_id,client_slug,campaign,platform,status,limit=100}) {
+async function listDiscoverySets(input={}) {
   const where=[]; const args=[];
-  const filters = {content_id,client_slug,campaign,platform,status};
-  for (const [key,value] of Object.entries(filters)) {
-    if (!value) continue;
-    args.push(value);
-    where.push(key === 'status' ? `ds.status=$${args.length}` : key === 'content_id' ? `ds.content_id=$${args.length}` : `ci.${key}=$${args.length}`);
+  for (const key of ['content_id','client_slug','campaign','platform','status']) {
+    if (!input[key]) continue;
+    if (key === 'content_id' || key === 'status') { args.push(input[key]); where.push(`ds.${key}=$${args.length}`); }
+    else { args.push(input[key]); where.push(`ci.${key}=$${args.length}`); }
   }
+  const limit = Math.min(Math.max(Number(input.limit ?? 100),1),500);
   args.push(limit);
   return query(`
-    SELECT ds.*,ci.client_slug,ci.campaign,ci.platform,ci.format,ci.title,ci.published_at,ci.publisher_post_id
+    SELECT ds.*,ci.client_slug,ci.campaign,ci.platform,ci.title,ci.publisher_post_id,ci.published_url
     FROM discovery_sets ds JOIN content_items ci ON ci.id=ds.content_id
     ${where.length ? 'WHERE '+where.join(' AND ') : ''}
-    ORDER BY ds.created_at DESC LIMIT $${args.length}
+    ORDER BY ds.researched_at DESC, ds.version DESC LIMIT $${args.length}
   `,args);
 }
 
 async function recordDiscoveryMetrics(input) {
-  if (/\b(dummy|mock|sample|test|placeholder)\b/i.test(input.source)) {
-    throw new Error('DATA_INTEGRITY_FAILURE: test or placeholder analytics sources are forbidden');
-  }
-  const set = (await query(`
-    SELECT ds.*,ci.status AS content_status,ci.publisher_post_id
-    FROM discovery_sets ds JOIN content_items ci ON ci.id=ds.content_id
-    WHERE ds.id=$1
+  const source = String(input.source ?? '').trim();
+  if (/dummy|mock|sample|placeholder|test/i.test(source)) throw new Error('DATA_INTEGRITY_FAILURE: test/dummy metric source is not allowed');
+  const setRow = (await query(`
+    SELECT ds.*,ci.status AS content_status,ci.id AS bound_content_id
+    FROM discovery_sets ds JOIN content_items ci ON ci.id=ds.content_id WHERE ds.id=$1
   `,[input.discovery_set_id]))[0];
-  if (!set) throw new Error('Discovery set not found');
-  if (set.content_status !== 'published') throw new Error('Metrics require a confirmed published content item');
-  const metrics = input.metrics ?? {};
-  const entries = Object.entries(metrics);
-  if (entries.length === 0) throw new Error('At least one verified metric is required');
-  for (const [key,value] of entries) {
-    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new Error(`Metric ${key} must be a non-negative number`);
-  }
+  if (!setRow) throw new Error('Discovery set not found');
+  if (setRow.content_status !== 'published') throw new Error('Metrics may only be recorded for content confirmed as published');
   const rows = await query(`
     INSERT INTO discovery_metrics
       (discovery_set_id,content_id,source,source_record_id,measured_at,window_hours,metrics,notes)
-    VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8)
+    VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8)
     ON CONFLICT (discovery_set_id,source,source_record_id,window_hours,measured_at) DO UPDATE SET
       metrics=EXCLUDED.metrics,notes=EXCLUDED.notes
     RETURNING *
-  `,[input.discovery_set_id,set.content_id,input.source,input.source_record_id,input.measured_at,input.window_hours,
-     JSON.stringify(metrics),input.notes ?? null]);
-  await query("UPDATE discovery_sets SET status='evaluated',updated_at=now() WHERE id=$1",[input.discovery_set_id]);
+  `,[input.discovery_set_id,setRow.bound_content_id,source,input.source_record_id,input.measured_at,input.window_hours,
+      JSON.stringify(input.metrics),input.notes ?? null]);
   return rows[0];
 }
 
-async function discoveryLearning({client_slug,campaign,platform,window_hours,limit=100}) {
-  const args=[client_slug]; const where=['ci.client_slug=$1'];
-  for (const [key,value] of [['campaign',campaign],['platform',platform]]) {
-    if (value) { args.push(value); where.push(`ci.${key}=$${args.length}`); }
-  }
-  if (window_hours) { args.push(window_hours); where.push(`dm.window_hours=$${args.length}`); }
-  args.push(limit);
-  const rows = await query(`
-    SELECT ds.id AS discovery_set_id,ds.version,ds.terms,ds.layers,ds.hypothesis,
-           ci.id AS content_id,ci.format,ci.title,ci.published_at,
+async function discoveryLearning(input) {
+  const where=['ci.client_slug=$1']; const args=[input.client_slug];
+  for (const [key,value] of [['campaign',input.campaign],['platform',input.platform]]) if(value){args.push(value);where.push(`ci.${key}=$${args.length}`)}
+  if (input.window_hours) { args.push(input.window_hours); where.push(`dm.window_hours=$${args.length}`); }
+  const limit=Math.min(Math.max(Number(input.limit ?? 100),1),500); args.push(limit);
+  const observations=await query(`
+    SELECT ds.id AS discovery_set_id,ds.version,ds.terms,ds.layers,ds.hypothesis,ds.researched_at,
+           ci.id AS content_id,ci.title,ci.format,ci.published_at,ci.publisher_post_id,ci.published_url,
            dm.source,dm.source_record_id,dm.measured_at,dm.window_hours,dm.metrics
     FROM discovery_metrics dm
     JOIN discovery_sets ds ON ds.id=dm.discovery_set_id
@@ -362,114 +345,73 @@ async function discoveryLearning({client_slug,campaign,platform,window_hours,lim
     WHERE ${where.join(' AND ')}
     ORDER BY dm.measured_at DESC LIMIT $${args.length}
   `,args);
-  return {
-    client_slug,campaign:campaign ?? null,platform:platform ?? null,window_hours:window_hours ?? null,
-    measurement_count:rows.length,
-    integrity:rows.length ? 'VERIFIED_METRICS_AVAILABLE' : 'PENDING_METRICS',
-    observations:rows
-  };
+  return {client_slug:input.client_slug,campaign:input.campaign ?? null,platform:input.platform ?? null,observations,integrity_status:observations.length?'VERIFIED':'PENDING_METRICS'};
 }
 
-async function dashboard(client_slug, campaign='default', platform='instagram') {
-  const counts = await query(`
-    SELECT status, count(*)::int AS count
-    FROM content_items
-    WHERE client_slug=$1 AND campaign=$2 AND platform=$3
-    GROUP BY status
-  `,[client_slug,campaign,platform]);
-  const plan = (await query(`SELECT * FROM social_plans WHERE client_slug=$1 AND campaign=$2 AND platform=$3 AND active=true`,[client_slug,campaign,platform]))[0] ?? null;
-  const future = (await query(`
-    SELECT count(*)::int AS count
-    FROM content_items
-    WHERE client_slug=$1 AND campaign=$2 AND platform=$3
-      AND status IN ('approved','scheduled')
-      AND (scheduled_at IS NULL OR scheduled_at >= now())
-  `,[client_slug,campaign,platform]))[0].count;
-  const published7d = (await query(`
-    SELECT count(*)::int AS count FROM content_items
-    WHERE client_slug=$1 AND campaign=$2 AND platform=$3
-      AND status='published' AND published_at >= now() - interval '7 days'
-  `,[client_slug,campaign,platform]))[0].count;
-  const calendar = (await query(`SELECT * FROM client_calendars WHERE client_slug=$1`,[client_slug]))[0] ?? null;
-  const byStatus = Object.fromEntries(STATUSES.map(s => [s,0]));
-  for (const row of counts) byStatus[row.status] = row.count;
-  const replenish = plan ? future < plan.buffer_min : false;
-  const replenish_count = plan && replenish ? Math.max(0, plan.buffer_target - future) : 0;
-  return {client_slug,campaign,platform,plan,calendar,counts:byStatus,future_inventory:future,published_last_7_days:published7d,replenish,replenish_count};
-}
+const GOOGLE_CLIENT_ID=process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET=process.env.GOOGLE_CLIENT_SECRET;
+const GOOGLE_REFRESH_TOKEN=process.env.GOOGLE_REFRESH_TOKEN;
 
 async function getClientCalendar(clientSlug) {
   return (await query('SELECT * FROM client_calendars WHERE client_slug=$1',[clientSlug]))[0] ?? null;
 }
 
-async function storeClientCalendar({client_slug,google_calendar_id,calendar_name,timezone='America/Bogota',source='google-calendar'}) {
-  const rows = await query(`
+async function storeClientCalendar(input) {
+  const rows=await query(`
     INSERT INTO client_calendars(client_slug,google_calendar_id,calendar_name,timezone,source,updated_at)
     VALUES($1,$2,$3,$4,$5,now())
-    ON CONFLICT(client_slug) DO UPDATE SET
-      google_calendar_id=EXCLUDED.google_calendar_id,
-      calendar_name=EXCLUDED.calendar_name,
-      timezone=EXCLUDED.timezone,
-      source=EXCLUDED.source,
-      updated_at=now()
+    ON CONFLICT(client_slug) DO UPDATE SET google_calendar_id=EXCLUDED.google_calendar_id,calendar_name=EXCLUDED.calendar_name,
+      timezone=EXCLUDED.timezone,source=EXCLUDED.source,updated_at=now()
     RETURNING *
-  `,[client_slug,google_calendar_id,calendar_name,timezone,source]);
+  `,[input.client_slug,input.google_calendar_id,input.calendar_name,input.timezone ?? 'America/Bogota',input.source ?? 'google-calendar']);
+  return rows[0];
+}
+
+async function linkCalendarEvent(contentId,input) {
+  const rows=await query(`UPDATE content_items SET google_calendar_id=$2,google_calendar_event_id=$3,calendar_sync_status=$4,updated_at=now() WHERE id=$1 RETURNING *`,
+    [contentId,input.google_calendar_id,input.google_calendar_event_id,input.calendar_sync_status ?? 'linked']);
+  if(!rows[0]) throw new Error('Content item not found');
+  await query(`INSERT INTO content_events(content_id,event_type,actor,payload) VALUES($1,'calendar_linked',$2,$3::jsonb)`,
+    [contentId,input.actor ?? 'social-manager',JSON.stringify({google_calendar_id:input.google_calendar_id,google_calendar_event_id:input.google_calendar_event_id,calendar_sync_status:input.calendar_sync_status ?? 'linked'})]);
   return rows[0];
 }
 
 async function googleAccessToken() {
-  const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN } = process.env;
-  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REFRESH_TOKEN) {
-    const error = new Error('Google Calendar creation is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN with Calendar scope.');
-    error.code = 'GOOGLE_OAUTH_NOT_CONFIGURED';
-    throw error;
+  if(!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REFRESH_TOKEN) {
+    const error=new Error('Google OAuth credentials are not configured for calendar provisioning'); error.code='GOOGLE_OAUTH_NOT_CONFIGURED'; throw error;
   }
-  const response = await fetch('https://oauth2.googleapis.com/token', {
-    method:'POST',
-    headers:{'content-type':'application/x-www-form-urlencoded'},
-    body:new URLSearchParams({
-      client_id:GOOGLE_CLIENT_ID,
-      client_secret:GOOGLE_CLIENT_SECRET,
-      refresh_token:GOOGLE_REFRESH_TOKEN,
-      grant_type:'refresh_token'
-    })
+  const response=await fetch('https://oauth2.googleapis.com/token',{
+    method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({client_id:GOOGLE_CLIENT_ID,client_secret:GOOGLE_CLIENT_SECRET,refresh_token:GOOGLE_REFRESH_TOKEN,grant_type:'refresh_token'})
   });
-  const data = await response.json();
-  if (!response.ok || !data.access_token) throw new Error(`Google OAuth refresh failed: ${data.error_description ?? data.error ?? response.status}`);
+  const data=await response.json();
+  if(!response.ok || !data.access_token) throw new Error(`Google OAuth refresh failed: ${data.error_description ?? data.error ?? response.status}`);
   return data.access_token;
 }
 
 async function ensureClientCalendar(input) {
-  const existing = await getClientCalendar(input.client_slug);
-  if (existing && !input.force_new) return {created:false,calendar:existing};
-
-  const token = await googleAccessToken();
-  const calendarName = input.calendar_name ?? `Social — ${input.client_slug}`;
-  const timezone = input.timezone ?? 'America/Bogota';
-  const response = await fetch('https://www.googleapis.com/calendar/v3/calendars', {
-    method:'POST',
-    headers:{authorization:`Bearer ${token}`,'content-type':'application/json'},
-    body:JSON.stringify({
-      summary:calendarName,
-      description:input.description ?? `Oneforall Social Manager calendar for ${input.client_slug}`,
-      timeZone:timezone
-    })
-  });
-  const data = await response.json();
-  if (!response.ok || !data.id) throw new Error(`Google Calendar creation failed: ${data.error?.message ?? response.status}`);
-  const calendar = await storeClientCalendar({
-    client_slug:input.client_slug,
-    google_calendar_id:data.id,
-    calendar_name:data.summary ?? calendarName,
-    timezone:data.timeZone ?? timezone,
-    source:'oneforall-google-api'
-  });
+  const existing=await getClientCalendar(input.client_slug);
+  if(existing && !input.force_new) return {created:false,calendar:existing};
+  const token=await googleAccessToken();
+  const calendarName=input.calendar_name ?? `Social — ${input.client_slug}`;
+  const timezone=input.timezone ?? 'America/Bogota';
+  const response=await fetch('https://www.googleapis.com/calendar/v3/calendars',{method:'POST',headers:{authorization:`Bearer ${token}`,'content-type':'application/json'},body:JSON.stringify({summary:calendarName,description:input.description ?? `Oneforall Social Manager calendar for ${input.client_slug}`,timeZone:timezone})});
+  const data=await response.json();
+  if(!response.ok || !data.id) throw new Error(`Google Calendar creation failed: ${data.error?.message ?? response.status}`);
+  const calendar=await storeClientCalendar({client_slug:input.client_slug,google_calendar_id:data.id,calendar_name:data.summary ?? calendarName,timezone:data.timeZone ?? timezone,source:'oneforall-google-api'});
   return {created:true,calendar};
 }
 
 app.get('/health', async (_req,res) => {
-  try { await query('SELECT 1'); res.json({ok:true,service:'oneforall-social-manager',version:VERSION,authentication:AUTH_ENABLED?'oauth2':'legacy-anonymous'}); }
-  catch (e) { res.status(503).json({ok:false,error:e.message}); }
+  try {
+    await query('SELECT 1');
+    res.json({
+      ok:true,
+      service:'oneforall-social-manager',
+      version:VERSION,
+      authentication:AUTH_ENABLED?'oauth2':'legacy-anonymous',
+      oauth:authDiagnostics()
+    });
+  } catch (e) { res.status(503).json({ok:false,error:e.message,oauth:authDiagnostics()}); }
 });
 
 app.use('/api', authenticateRequest, (req,res,next) =>
