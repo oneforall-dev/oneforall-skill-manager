@@ -1,0 +1,25 @@
+{
+  "name": "oneforall-social-manager-backend",
+  "version": "0.6.1",
+  "private": true,
+  "type": "module",
+  "description": "Persistent editorial pipeline, Google Calendar mapping/provisioning and MCP backend for Oneforall Social Manager.",
+  "scripts": {
+    "start": "node src/server-v3.js",
+    "dev": "node --watch src/server-v3.js",
+    "migrate": "psql \"$DATABASE_URL\" -f migrations/001_init.sql && psql \"$DATABASE_URL\" -f migrations/002_google_calendar.sql && psql \"$DATABASE_URL\" -f migrations/003_discovery_strategy.sql",
+    "auth:check": "node scripts/check-auth-config.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/express": "^2.0.0",
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "express": "^5.0.0",
+    "jose": "^6.1.0",
+    "pg": "^8.0.0",
+    "zod": "^4.0.0"
+  }
+}
