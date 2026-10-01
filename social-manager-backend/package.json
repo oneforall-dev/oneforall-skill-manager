@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node src/server-v3.js",
     "dev": "node --watch src/server-v3.js",
-    "migrate": "psql \"$DATABASE_URL\" -f migrations/001_init.sql && psql \"$DATABASE_URL\" -f migrations/002_google_calendar.sql && psql \"$DATABASE_URL\" -f migrations/003_discovery_strategy.sql"
+    "migrate": "psql \"$DATABASE_URL\" -f migrations/001_init.sql && psql \"$DATABASE_URL\" -f migrations/002_google_calendar.sql && psql \"$DATABASE_URL\" -f migrations/003_discovery_strategy.sql",
+    "auth:check": "node scripts/check-auth-config.mjs"
   },
   "engines": {
     "node": ">=20"
