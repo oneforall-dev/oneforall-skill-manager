@@ -13,6 +13,8 @@ Persistent editorial-state service for the Oneforall Social Manager plugin.
 - Google Calendar mapping per client
 - Google Calendar event IDs per content item
 - immutable status-change events
+- researched four-layer discovery/hashtag sets per content item
+- verified post-publish discovery measurements and rotation history
 
 ## Pipeline
 
@@ -50,6 +52,10 @@ The orchestrator should first advance existing ideas and incomplete production b
 - `GET /api/calendars/:client`
 - `POST /api/calendars/register`
 - `POST /api/calendars/ensure`
+- `POST /api/discovery/sets`
+- `GET /api/discovery/sets`
+- `POST /api/discovery/metrics`
+- `GET /api/discovery/learning/:client`
 
 ## MCP endpoint
 
@@ -66,6 +72,14 @@ Exposed tools:
 - `register_client_calendar`
 - `ensure_client_calendar`
 - `link_calendar_event`
+- `save_discovery_set`
+- `list_discovery_sets`
+- `record_discovery_metrics`
+- `get_discovery_learning`
+
+## Discovery integrity
+
+Discovery sets combine four explicit layers: world/lore, artist/entity, genre/niche and the exact post context. Every saved set requires current research evidence and is versioned against one content item. Post-publish metrics are accepted only for content confirmed as published and must include an external source record. Dummy, mock, sample, test and placeholder sources are rejected. When no verified analytics source is connected, learning remains `PENDING_METRICS` instead of fabricating performance.
 
 ## Google Calendar architecture
 

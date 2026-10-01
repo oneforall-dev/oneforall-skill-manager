@@ -8,7 +8,7 @@ import { createMcpExpressApp } from '@modelcontextprotocol/express';
 const { Pool } = pg;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 const STATUSES = [
   'idea','generated','in_production','produced','audit','needs_revision',
   'approved','scheduled','published','blocked','failed'
@@ -27,6 +27,45 @@ app.use(express.json({ limit: '2mb' }));
 async function query(text, params = []) {
   const result = await pool.query(text, params);
   return result.rows;
+}
+
+async function ensureDiscoverySchema() {
+  await query(`
+    CREATE TABLE IF NOT EXISTS discovery_sets (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      content_id uuid NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+      version integer NOT NULL CHECK (version > 0),
+      status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','selected','published','evaluated','retired')),
+      language text NOT NULL DEFAULT 'en',
+      layers jsonb NOT NULL,
+      terms jsonb NOT NULL,
+      rationale text,
+      evidence jsonb NOT NULL DEFAULT '[]'::jsonb,
+      hypothesis text,
+      researched_at timestamptz NOT NULL,
+      selected_at timestamptz,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      UNIQUE (content_id, version)
+    );
+    CREATE INDEX IF NOT EXISTS idx_discovery_sets_content
+      ON discovery_sets (content_id, status, version DESC);
+    CREATE TABLE IF NOT EXISTS discovery_metrics (
+      id bigserial PRIMARY KEY,
+      discovery_set_id uuid NOT NULL REFERENCES discovery_sets(id) ON DELETE CASCADE,
+      content_id uuid NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+      source text NOT NULL,
+      source_record_id text NOT NULL,
+      measured_at timestamptz NOT NULL,
+      window_hours integer NOT NULL CHECK (window_hours > 0),
+      metrics jsonb NOT NULL,
+      notes text,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      UNIQUE (discovery_set_id, source, source_record_id, window_hours, measured_at)
+    );
+    CREATE INDEX IF NOT EXISTS idx_discovery_metrics_set
+      ON discovery_metrics (discovery_set_id, measured_at DESC);
+  `);
 }
 
 async function upsertPlan(input) {
@@ -112,6 +151,125 @@ async function linkCalendarEvent(contentId, input) {
                VALUES($1,'calendar_linked',$2,$2,$3,$4::jsonb)`,
     [contentId,current.status,input.actor ?? 'social-manager',JSON.stringify(input)]);
   return rows[0];
+}
+
+async function saveDiscoverySet(input) {
+  const content = (await query('SELECT * FROM content_items WHERE id=$1',[input.content_id]))[0];
+  if (!content) throw new Error('Content item not found');
+  const requiredLayers = ['world_lore','artist_entity','genre_niche','post_context'];
+  for (const layer of requiredLayers) {
+    if (!Array.isArray(input.layers?.[layer]) || input.layers[layer].length === 0) {
+      throw new Error(`Discovery layer ${layer} must contain at least one term`);
+    }
+  }
+  const terms = [...new Set((input.terms ?? []).map(term => String(term).trim()).filter(Boolean))];
+  if (terms.length === 0) throw new Error('Discovery terms cannot be empty');
+  if (!Array.isArray(input.evidence) || input.evidence.length === 0) {
+    throw new Error('Current research evidence is required; do not save unsupported discovery sets');
+  }
+  const version = input.version ?? (await query(
+    'SELECT COALESCE(max(version),0)::int + 1 AS version FROM discovery_sets WHERE content_id=$1',
+    [input.content_id]
+  ))[0].version;
+  const status = input.status ?? 'draft';
+  if (status === 'selected') {
+    await query("UPDATE discovery_sets SET status='retired',updated_at=now() WHERE content_id=$1 AND status='selected'",[input.content_id]);
+  }
+  const rows = await query(`
+    INSERT INTO discovery_sets
+      (content_id,version,status,language,layers,terms,rationale,evidence,hypothesis,researched_at,selected_at)
+    VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8::jsonb,$9,$10,$11)
+    ON CONFLICT (content_id,version) DO UPDATE SET
+      status=EXCLUDED.status,
+      language=EXCLUDED.language,
+      layers=EXCLUDED.layers,
+      terms=EXCLUDED.terms,
+      rationale=EXCLUDED.rationale,
+      evidence=EXCLUDED.evidence,
+      hypothesis=EXCLUDED.hypothesis,
+      researched_at=EXCLUDED.researched_at,
+      selected_at=EXCLUDED.selected_at,
+      updated_at=now()
+    RETURNING *
+  `,[input.content_id,version,status,input.language ?? 'en',JSON.stringify(input.layers),JSON.stringify(terms),
+     input.rationale ?? null,JSON.stringify(input.evidence),input.hypothesis ?? null,input.researched_at,
+     status === 'selected' ? new Date().toISOString() : null]);
+  await query(`INSERT INTO content_events(content_id,event_type,from_status,to_status,actor,payload)
+               VALUES($1,'discovery_set_saved',$2,$2,$3,$4::jsonb)`,
+    [input.content_id,content.status,input.actor ?? 'social-manager',JSON.stringify({discovery_set_id:rows[0].id,version,status})]);
+  return rows[0];
+}
+
+async function listDiscoverySets({content_id,client_slug,campaign,platform,status,limit=100}) {
+  const where=[]; const args=[];
+  const filters = {content_id,client_slug,campaign,platform,status};
+  for (const [key,value] of Object.entries(filters)) {
+    if (!value) continue;
+    args.push(value);
+    where.push(key === 'status' ? `ds.status=$${args.length}` : key === 'content_id' ? `ds.content_id=$${args.length}` : `ci.${key}=$${args.length}`);
+  }
+  args.push(limit);
+  return query(`
+    SELECT ds.*,ci.client_slug,ci.campaign,ci.platform,ci.format,ci.title,ci.published_at,ci.publisher_post_id
+    FROM discovery_sets ds JOIN content_items ci ON ci.id=ds.content_id
+    ${where.length ? 'WHERE '+where.join(' AND ') : ''}
+    ORDER BY ds.created_at DESC LIMIT $${args.length}
+  `,args);
+}
+
+async function recordDiscoveryMetrics(input) {
+  if (/\b(dummy|mock|sample|test|placeholder)\b/i.test(input.source)) {
+    throw new Error('DATA_INTEGRITY_FAILURE: test or placeholder analytics sources are forbidden');
+  }
+  const set = (await query(`
+    SELECT ds.*,ci.status AS content_status,ci.publisher_post_id
+    FROM discovery_sets ds JOIN content_items ci ON ci.id=ds.content_id
+    WHERE ds.id=$1
+  `,[input.discovery_set_id]))[0];
+  if (!set) throw new Error('Discovery set not found');
+  if (set.content_status !== 'published') throw new Error('Metrics require a confirmed published content item');
+  const metrics = input.metrics ?? {};
+  const entries = Object.entries(metrics);
+  if (entries.length === 0) throw new Error('At least one verified metric is required');
+  for (const [key,value] of entries) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new Error(`Metric ${key} must be a non-negative number`);
+  }
+  const rows = await query(`
+    INSERT INTO discovery_metrics
+      (discovery_set_id,content_id,source,source_record_id,measured_at,window_hours,metrics,notes)
+    VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8)
+    ON CONFLICT (discovery_set_id,source,source_record_id,window_hours,measured_at) DO UPDATE SET
+      metrics=EXCLUDED.metrics,notes=EXCLUDED.notes
+    RETURNING *
+  `,[input.discovery_set_id,set.content_id,input.source,input.source_record_id,input.measured_at,input.window_hours,
+     JSON.stringify(metrics),input.notes ?? null]);
+  await query("UPDATE discovery_sets SET status='evaluated',updated_at=now() WHERE id=$1",[input.discovery_set_id]);
+  return rows[0];
+}
+
+async function discoveryLearning({client_slug,campaign,platform,window_hours,limit=100}) {
+  const args=[client_slug]; const where=['ci.client_slug=$1'];
+  for (const [key,value] of [['campaign',campaign],['platform',platform]]) {
+    if (value) { args.push(value); where.push(`ci.${key}=$${args.length}`); }
+  }
+  if (window_hours) { args.push(window_hours); where.push(`dm.window_hours=$${args.length}`); }
+  args.push(limit);
+  const rows = await query(`
+    SELECT ds.id AS discovery_set_id,ds.version,ds.terms,ds.layers,ds.hypothesis,
+           ci.id AS content_id,ci.format,ci.title,ci.published_at,
+           dm.source,dm.source_record_id,dm.measured_at,dm.window_hours,dm.metrics
+    FROM discovery_metrics dm
+    JOIN discovery_sets ds ON ds.id=dm.discovery_set_id
+    JOIN content_items ci ON ci.id=dm.content_id
+    WHERE ${where.join(' AND ')}
+    ORDER BY dm.measured_at DESC LIMIT $${args.length}
+  `,args);
+  return {
+    client_slug,campaign:campaign ?? null,platform:platform ?? null,window_hours:window_hours ?? null,
+    measurement_count:rows.length,
+    integrity:rows.length ? 'VERIFIED_METRICS_AVAILABLE' : 'PENDING_METRICS',
+    observations:rows
+  };
 }
 
 async function dashboard(client_slug, campaign='default', platform='instagram') {
@@ -267,10 +425,32 @@ app.post('/api/calendars/ensure', async (req,res) => {
   catch (e) { res.status(e.code === 'GOOGLE_OAUTH_NOT_CONFIGURED' ? 503 : 400).json({error:e.message,code:e.code ?? null}); }
 });
 
+app.post('/api/discovery/sets', async (req,res) => {
+  try { res.status(201).json(await saveDiscoverySet(req.body)); }
+  catch (e) { res.status(400).json({error:e.message}); }
+});
+
+app.get('/api/discovery/sets', async (req,res) => {
+  try { res.json(await listDiscoverySets(req.query)); }
+  catch (e) { res.status(400).json({error:e.message}); }
+});
+
+app.post('/api/discovery/metrics', async (req,res) => {
+  try { res.status(201).json(await recordDiscoveryMetrics(req.body)); }
+  catch (e) { res.status(400).json({error:e.message}); }
+});
+
+app.get('/api/discovery/learning/:client', async (req,res) => {
+  try { res.json(await discoveryLearning({client_slug:req.params.client,...req.query})); }
+  catch (e) { res.status(400).json({error:e.message}); }
+});
+
 function toolResult(value) { return { content: [{ type: 'text', text: JSON.stringify(value) }] }; }
 
 function buildMcpServer() {
-  const server = new McpServer({ name: 'oneforall-social-manager', version: VERSION });       const tool = (name, description, inputSchema, handler) => server.registerTool(name, { description, inputSchema }, handler);   
+  const server = new McpServer({ name: 'oneforall-social-manager', version: VERSION });
+  const tool = (name, description, inputSchema, handler) =>
+    server.registerTool(name, { description, inputSchema }, handler);
   tool('get_social_dashboard','Get pipeline counts, plan, future inventory, client calendar mapping and replenishment requirement',{
     client_slug:z.string(), campaign:z.string().default('default'), platform:z.string().default('instagram')
   },async ({client_slug,campaign,platform}) => toolResult(await dashboard(client_slug,campaign,platform)));
@@ -315,6 +495,29 @@ function buildMcpServer() {
     content_id:z.string().uuid(),google_calendar_id:z.string(),google_calendar_event_id:z.string(),calendar_sync_status:z.string().default('linked'),actor:z.string().default('social-manager')
   },async ({content_id,...input}) => toolResult(await linkCalendarEvent(content_id,input)));
 
+  tool('save_discovery_set','Persist a researched, versioned discovery/hashtag set bound to one content item',{
+    content_id:z.string().uuid(),version:z.number().int().positive().optional(),status:z.enum(['draft','selected','published','evaluated','retired']).default('draft'),
+    language:z.string().default('en'),layers:z.object({
+      world_lore:z.array(z.string()).min(1),artist_entity:z.array(z.string()).min(1),genre_niche:z.array(z.string()).min(1),post_context:z.array(z.string()).min(1)
+    }),terms:z.array(z.string()).min(1),rationale:z.string().optional(),evidence:z.array(z.record(z.any())).min(1),
+    hypothesis:z.string().optional(),researched_at:z.string(),actor:z.string().default('social-manager')
+  },async input => toolResult(await saveDiscoverySet(input)));
+
+  tool('list_discovery_sets','List persisted discovery sets with exact item and publication bindings',{
+    content_id:z.string().uuid().optional(),client_slug:z.string().optional(),campaign:z.string().optional(),platform:z.string().optional(),
+    status:z.enum(['draft','selected','published','evaluated','retired']).optional(),limit:z.number().int().min(1).max(500).default(100)
+  },async input => toolResult(await listDiscoverySets(input)));
+
+  tool('record_discovery_metrics','Record verified post-publish metrics for the exact discovery set used; rejects dummy/test sources',{
+    discovery_set_id:z.string().uuid(),source:z.string(),source_record_id:z.string(),measured_at:z.string(),window_hours:z.number().int().positive(),
+    metrics:z.record(z.number().nonnegative()),notes:z.string().optional()
+  },async input => toolResult(await recordDiscoveryMetrics(input)));
+
+  tool('get_discovery_learning','Retrieve verified observations for discovery rotation without fabricating causality',{
+    client_slug:z.string(),campaign:z.string().optional(),platform:z.string().optional(),window_hours:z.number().int().positive().optional(),
+    limit:z.number().int().min(1).max(500).default(100)
+  },async input => toolResult(await discoveryLearning(input)));
+
   return server;
 }
 
@@ -327,4 +530,6 @@ app.post('/mcp', async (req,res) => {
 });
 
 const port = Number(process.env.PORT ?? 3000);
-app.listen(port, () => console.log(`Oneforall Social Manager ${VERSION} listening on ${port}`));
+ensureDiscoverySchema()
+  .then(() => app.listen(port, () => console.log(`Oneforall Social Manager ${VERSION} listening on ${port}`)))
+  .catch(error => { console.error('Database schema initialization failed', error); process.exit(1); });
