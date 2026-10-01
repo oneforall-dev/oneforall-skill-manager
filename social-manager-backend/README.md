@@ -61,6 +61,38 @@ The orchestrator should first advance existing ideas and incomplete production b
 
 - `POST /mcp`
 
+## Internal OAuth access
+
+Production access is designed for OAuth 2.1 authorization-code + PKCE. Authentication is feature-gated so the existing ChatGPT connection is not interrupted before the identity provider is ready.
+
+Configure these Coolify secrets:
+
+- `AUTH_ENABLED=true`
+- `AUTH_ISSUER` — exact authorization-server issuer, including its trailing slash when advertised
+- `AUTH_AUDIENCE=https://social-manager.ocloud.click`
+- `AUTH_JWKS_URI` — authorization-server JWKS endpoint
+- `AUTH_EMAIL_CLAIM=https://oneforall.ocloud.click/email`
+- `MCP_RESOURCE_URL=https://social-manager.ocloud.click`
+- `ALLOWED_EMAILS=wilson.meza@gmail.com,agency.oneforall@gmail.com`
+
+The authorization server must place the normalized user email in the configured custom claim and issue these scopes as appropriate:
+
+- `social.read`
+- `social.write`
+- `social.publish`
+- `social.admin`
+
+When OAuth is enabled, the backend publishes protected-resource metadata at `/.well-known/oauth-protected-resource`, validates JWT signature, issuer, audience, expiry, email allowlist and scopes, and rejects every other account. REST reads require `social.read`; REST mutations require `social.write`. Individual MCP tools advertise and enforce their own scopes.
+
+Rollout order:
+
+1. Configure and test the identity provider with both allowed accounts.
+2. Deploy this version with `AUTH_ENABLED=false`.
+3. Test the OAuth metadata and tokens in a non-production connection.
+4. Change the ChatGPT MCP connection to OAuth and authorize an allowed account.
+5. Set `AUTH_ENABLED=true` and verify read and write tools.
+6. Confirm that anonymous requests and a non-allowlisted account receive `401 Unauthorized`.
+
 Exposed tools:
 
 - `get_social_dashboard`

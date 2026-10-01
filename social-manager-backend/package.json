@@ -1,6 +1,6 @@
 {
   "name": "oneforall-social-manager-backend",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "description": "Persistent editorial pipeline, Google Calendar mapping/provisioning and MCP backend for Oneforall Social Manager.",
@@ -17,6 +17,7 @@
     "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "express": "^5.0.0",
+    "jose": "^6.1.0",
     "pg": "^8.0.0",
     "zod": "^4.0.0"
   }

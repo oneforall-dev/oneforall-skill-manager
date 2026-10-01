@@ -4,11 +4,24 @@ import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/server';
 import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
 import { createMcpExpressApp } from '@modelcontextprotocol/express';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 const { Pool } = pg;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
+const AUTH_ENABLED = /^(1|true|yes)$/i.test(process.env.AUTH_ENABLED ?? 'false');
+const AUTH_ISSUER = process.env.AUTH_ISSUER;
+const AUTH_AUDIENCE = process.env.AUTH_AUDIENCE;
+const AUTH_JWKS_URI = process.env.AUTH_JWKS_URI ?? (AUTH_ISSUER ? `${AUTH_ISSUER.replace(/\/$/, '')}/.well-known/jwks.json` : null);
+const AUTH_EMAIL_CLAIM = process.env.AUTH_EMAIL_CLAIM ?? 'https://oneforall.ocloud.click/email';
+const MCP_RESOURCE_URL = (process.env.MCP_RESOURCE_URL ?? 'https://social-manager.ocloud.click').replace(/\/$/, '');
+const ALLOWED_EMAILS = new Set(
+  (process.env.ALLOWED_EMAILS ?? 'wilson.meza@gmail.com,agency.oneforall@gmail.com')
+    .split(',').map(value => value.trim().toLowerCase()).filter(Boolean)
+);
+const OAUTH_SCOPES = ['social.read','social.write','social.publish','social.admin'];
+let remoteJwks;
 const STATUSES = [
   'idea','generated','in_production','produced','audit','needs_revision',
   'approved','scheduled','published','blocked','failed'
@@ -23,6 +36,91 @@ const app = createMcpExpressApp ? createMcpExpressApp({
   ]
 }) : express();
 app.use(express.json({ limit: '2mb' }));
+
+function authChallenge(requiredScopes = ['social.read'], error = 'invalid_token', description = 'Authentication is required') {
+  const metadata = `${MCP_RESOURCE_URL}/.well-known/oauth-protected-resource`;
+  return `Bearer resource_metadata="${metadata}", scope="${requiredScopes.join(' ')}", error="${error}", error_description="${description}"`;
+}
+
+function unauthorized(res, requiredScopes, error, description) {
+  const challenge = authChallenge(requiredScopes, error, description);
+  res.set('WWW-Authenticate', challenge);
+  return res.status(401).json({ error, error_description: description });
+}
+
+function validateAuthConfiguration() {
+  if (!AUTH_ENABLED) return;
+  const missing = [
+    ['AUTH_ISSUER', AUTH_ISSUER],
+    ['AUTH_AUDIENCE', AUTH_AUDIENCE],
+    ['AUTH_JWKS_URI', AUTH_JWKS_URI]
+  ].filter(([,value]) => !value).map(([name]) => name);
+  if (missing.length) throw new Error(`OAuth is enabled but missing: ${missing.join(', ')}`);
+  if (ALLOWED_EMAILS.size === 0) throw new Error('OAuth is enabled but ALLOWED_EMAILS is empty');
+}
+
+function scopesFromPayload(payload) {
+  const scopes = new Set(String(payload.scope ?? '').split(/\s+/).filter(Boolean));
+  for (const permission of Array.isArray(payload.permissions) ? payload.permissions : []) scopes.add(permission);
+  return scopes;
+}
+
+async function verifyAccessToken(token) {
+  if (!remoteJwks) remoteJwks = createRemoteJWKSet(new URL(AUTH_JWKS_URI));
+  const { payload } = await jwtVerify(token, remoteJwks, {
+    issuer: AUTH_ISSUER,
+    audience: AUTH_AUDIENCE
+  });
+  const email = String(payload[AUTH_EMAIL_CLAIM] ?? payload.email ?? payload.upn ?? '').trim().toLowerCase();
+  if (!email || !ALLOWED_EMAILS.has(email)) {
+    const error = new Error('This account is not authorized for Oneforall Social Manager');
+    error.code = 'account_not_allowed';
+    throw error;
+  }
+  return { subject: payload.sub, email, scopes: scopesFromPayload(payload), claims: payload };
+}
+
+async function authenticateRequest(req, res, next) {
+  if (!AUTH_ENABLED) {
+    req.auth = { subject: 'legacy-anonymous', email: null, scopes: new Set(OAUTH_SCOPES), legacy: true };
+    return next();
+  }
+  const match = req.get('authorization')?.match(/^Bearer\s+(.+)$/i);
+  if (!match) return unauthorized(res, [], 'invalid_token', 'A valid OAuth access token is required');
+  try {
+    req.auth = await verifyAccessToken(match[1]);
+    return next();
+  } catch (error) {
+    const description = error.code === 'account_not_allowed'
+      ? error.message
+      : 'The OAuth access token is invalid or expired';
+    return unauthorized(res, [], error.code ?? 'invalid_token', description);
+  }
+}
+
+function requireScopes(requiredScopes) {
+  return (req, res, next) => {
+    if (requiredScopes.every(scope => req.auth?.scopes?.has(scope))) return next();
+    return unauthorized(res, requiredScopes, 'insufficient_scope', `Required scopes: ${requiredScopes.join(' ')}`);
+  };
+}
+
+function assertToolScopes(principal, requiredScopes) {
+  if (requiredScopes.every(scope => principal?.scopes?.has(scope))) return;
+  const error = new Error(`Required scopes: ${requiredScopes.join(' ')}`);
+  error.code = 'insufficient_scope';
+  error.challenge = authChallenge(requiredScopes, error.code, error.message);
+  throw error;
+}
+
+app.get('/.well-known/oauth-protected-resource', (_req,res) => {
+  if (!AUTH_ENABLED) return res.status(404).json({error:'oauth_not_enabled'});
+  res.json({
+    resource: MCP_RESOURCE_URL,
+    authorization_servers: [AUTH_ISSUER],
+    scopes_supported: OAUTH_SCOPES
+  });
+});
 
 async function query(text, params = []) {
   const result = await pool.query(text, params);
@@ -370,9 +468,13 @@ async function ensureClientCalendar(input) {
 }
 
 app.get('/health', async (_req,res) => {
-  try { await query('SELECT 1'); res.json({ok:true,service:'oneforall-social-manager',version:VERSION}); }
+  try { await query('SELECT 1'); res.json({ok:true,service:'oneforall-social-manager',version:VERSION,authentication:AUTH_ENABLED?'oauth2':'legacy-anonymous'}); }
   catch (e) { res.status(503).json({ok:false,error:e.message}); }
 });
+
+app.use('/api', authenticateRequest, (req,res,next) =>
+  requireScopes(req.method === 'GET' ? ['social.read'] : ['social.write'])(req,res,next)
+);
 
 app.get('/api/dashboard/:client', async (req,res) => {
   try { res.json(await dashboard(req.params.client, req.query.campaign ?? 'default', req.query.platform ?? 'instagram')); }
@@ -447,32 +549,48 @@ app.get('/api/discovery/learning/:client', async (req,res) => {
 
 function toolResult(value) { return { content: [{ type: 'text', text: JSON.stringify(value) }] }; }
 
-function buildMcpServer() {
+function buildMcpServer(principal) {
   const server = new McpServer({ name: 'oneforall-social-manager', version: VERSION });
-  const tool = (name, description, inputSchema, handler) =>
-    server.registerTool(name, { description, inputSchema }, handler);
+  const tool = (name, description, inputSchema, requiredScopes, handler) =>
+    server.registerTool(name, {
+      description,
+      inputSchema,
+      securitySchemes: [{type:'oauth2',scopes:requiredScopes}]
+    }, async input => {
+      try {
+        assertToolScopes(principal, requiredScopes);
+        return await handler(input);
+      } catch (error) {
+        if (!error.challenge) throw error;
+        return {
+          content:[{type:'text',text:`Authentication required: ${error.message}`}],
+          _meta:{'mcp/www_authenticate':[error.challenge]},
+          isError:true
+        };
+      }
+    });
   tool('get_social_dashboard','Get pipeline counts, plan, future inventory, client calendar mapping and replenishment requirement',{
     client_slug:z.string(), campaign:z.string().default('default'), platform:z.string().default('instagram')
-  },async ({client_slug,campaign,platform}) => toolResult(await dashboard(client_slug,campaign,platform)));
+  },['social.read'],async ({client_slug,campaign,platform}) => toolResult(await dashboard(client_slug,campaign,platform)));
 
   tool('set_social_plan','Create or update weekly publication plan and buffer thresholds',{
     client_slug:z.string(), campaign:z.string().default('default'), platform:z.string().default('instagram'),
     posts_per_week:z.number().int().positive(), buffer_min:z.number().int().nonnegative(), buffer_target:z.number().int().nonnegative(),
     format_mix:z.record(z.any()).optional(), pillar_mix:z.record(z.any()).optional(), preferred_slots:z.array(z.any()).optional(), active:z.boolean().optional()
-  },async input => toolResult(await upsertPlan(input)));
+  },['social.write'],async input => toolResult(await upsertPlan(input)));
 
   tool('create_content_item','Register an idea or production item in the persistent editorial pipeline',{
     client_slug:z.string(),campaign:z.string().default('default'),platform:z.string().default('instagram'),
     format:z.enum(['image','carousel','reel','story','other']),title:z.string(),pillar:z.string().optional(),idea:z.string().optional(),hook:z.string().optional(),objective:z.string().optional(),cta:z.string().optional(),status:z.enum(STATUSES).optional(),priority:z.number().int().min(0).max(100).optional(),caption:z.string().optional(),asset_ids:z.array(z.string()).optional(),director_project_id:z.string().optional(),google_calendar_id:z.string().optional(),google_calendar_event_id:z.string().optional(),calendar_sync_status:z.string().optional(),metadata:z.record(z.any()).optional()
-  },async input => toolResult(await createContent(input)));
+  },['social.write'],async input => toolResult(await createContent(input)));
 
   tool('transition_content_item','Change a content item state and record an immutable event',{
     content_id:z.string().uuid(),status:z.enum(STATUSES),actor:z.string().optional(),scheduled_at:z.string().optional(),published_at:z.string().optional(),publisher_post_id:z.string().optional(),published_url:z.string().optional(),asset_ids:z.array(z.string()).optional(),caption:z.string().optional(),approval_receipt:z.record(z.any()).optional(),google_calendar_id:z.string().optional(),google_calendar_event_id:z.string().optional(),calendar_sync_status:z.string().optional(),metadata:z.record(z.any()).optional()
-  },async ({content_id,status,actor,...patch}) => toolResult(await transitionContent(content_id,status,actor,patch)));
+  },['social.write'],async ({content_id,status,actor,...patch}) => toolResult(await transitionContent(content_id,status,actor,patch)));
 
   tool('list_content_items','List persistent content items by client and optional pipeline filters',{
     client_slug:z.string(),campaign:z.string().optional(),platform:z.string().optional(),status:z.enum(STATUSES).optional(),limit:z.number().int().min(1).max(500).default(100)
-  },async ({client_slug,campaign,platform,status,limit}) => {
+  },['social.read'],async ({client_slug,campaign,platform,status,limit}) => {
     const where=['client_slug=$1']; const args=[client_slug];
     for (const [key,value] of [['campaign',campaign],['platform',platform],['status',status]]) if(value){args.push(value);where.push(`${key}=$${args.length}`)}
     args.push(limit);
@@ -481,19 +599,19 @@ function buildMcpServer() {
 
   tool('get_client_calendar','Get the Google Calendar mapped to a Social Manager client',{
     client_slug:z.string()
-  },async ({client_slug}) => toolResult({calendar:await getClientCalendar(client_slug)}));
+  },['social.read'],async ({client_slug}) => toolResult({calendar:await getClientCalendar(client_slug)}));
 
   tool('register_client_calendar','Store a Google Calendar ID already created or selected through the connected Google Calendar capability',{
     client_slug:z.string(),google_calendar_id:z.string(),calendar_name:z.string(),timezone:z.string().default('America/Bogota'),source:z.string().default('google-calendar')
-  },async input => toolResult(await storeClientCalendar(input)));
+  },['social.write'],async input => toolResult(await storeClientCalendar(input)));
 
   tool('ensure_client_calendar','Create and persist one Google Calendar for a client when no mapping exists. Requires Google OAuth environment credentials on the backend.',{
     client_slug:z.string(),calendar_name:z.string().optional(),timezone:z.string().default('America/Bogota'),description:z.string().optional(),force_new:z.boolean().default(false)
-  },async input => toolResult(await ensureClientCalendar(input)));
+  },['social.admin'],async input => toolResult(await ensureClientCalendar(input)));
 
   tool('link_calendar_event','Link a Google Calendar event to one persistent content item',{
     content_id:z.string().uuid(),google_calendar_id:z.string(),google_calendar_event_id:z.string(),calendar_sync_status:z.string().default('linked'),actor:z.string().default('social-manager')
-  },async ({content_id,...input}) => toolResult(await linkCalendarEvent(content_id,input)));
+  },['social.write'],async ({content_id,...input}) => toolResult(await linkCalendarEvent(content_id,input)));
 
   tool('save_discovery_set','Persist a researched, versioned discovery/hashtag set bound to one content item',{
     content_id:z.string().uuid(),version:z.number().int().positive().optional(),status:z.enum(['draft','selected','published','evaluated','retired']).default('draft'),
@@ -501,28 +619,28 @@ function buildMcpServer() {
       world_lore:z.array(z.string()).min(1),artist_entity:z.array(z.string()).min(1),genre_niche:z.array(z.string()).min(1),post_context:z.array(z.string()).min(1)
     }),terms:z.array(z.string()).min(1),rationale:z.string().optional(),evidence:z.array(z.record(z.any())).min(1),
     hypothesis:z.string().optional(),researched_at:z.string(),actor:z.string().default('social-manager')
-  },async input => toolResult(await saveDiscoverySet(input)));
+  },['social.write'],async input => toolResult(await saveDiscoverySet(input)));
 
   tool('list_discovery_sets','List persisted discovery sets with exact item and publication bindings',{
     content_id:z.string().uuid().optional(),client_slug:z.string().optional(),campaign:z.string().optional(),platform:z.string().optional(),
     status:z.enum(['draft','selected','published','evaluated','retired']).optional(),limit:z.number().int().min(1).max(500).default(100)
-  },async input => toolResult(await listDiscoverySets(input)));
+  },['social.read'],async input => toolResult(await listDiscoverySets(input)));
 
   tool('record_discovery_metrics','Record verified post-publish metrics for the exact discovery set used; rejects dummy/test sources',{
     discovery_set_id:z.string().uuid(),source:z.string(),source_record_id:z.string(),measured_at:z.string(),window_hours:z.number().int().positive(),
     metrics:z.record(z.number().nonnegative()),notes:z.string().optional()
-  },async input => toolResult(await recordDiscoveryMetrics(input)));
+  },['social.write'],async input => toolResult(await recordDiscoveryMetrics(input)));
 
   tool('get_discovery_learning','Retrieve verified observations for discovery rotation without fabricating causality',{
     client_slug:z.string(),campaign:z.string().optional(),platform:z.string().optional(),window_hours:z.number().int().positive().optional(),
     limit:z.number().int().min(1).max(500).default(100)
-  },async input => toolResult(await discoveryLearning(input)));
+  },['social.read'],async input => toolResult(await discoveryLearning(input)));
 
   return server;
 }
 
-app.post('/mcp', async (req,res) => {
-  const server = buildMcpServer();
+app.post('/mcp', authenticateRequest, async (req,res) => {
+  const server = buildMcpServer(req.auth);
   const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on('close', () => { transport.close(); server.close(); });
   await server.connect(transport);
@@ -530,6 +648,7 @@ app.post('/mcp', async (req,res) => {
 });
 
 const port = Number(process.env.PORT ?? 3000);
+validateAuthConfiguration();
 ensureDiscoverySchema()
   .then(() => app.listen(port, () => console.log(`Oneforall Social Manager ${VERSION} listening on ${port}`)))
   .catch(error => { console.error('Database schema initialization failed', error); process.exit(1); });
