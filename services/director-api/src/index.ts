@@ -4,7 +4,8 @@ import { z } from "zod/v4";
 import { analyze, buildPlan, render } from "./media.js";
 import { ensureProjectDirs, listProjects, loadProject, saveProject } from "./store.js";
 import { contentItemExists, listContentItems, loadContentItem, saveContentItem } from "./content-store.js";
-import type { ContentItem, ContentStatus, Project } from "./types.js";
+import { characterExists, loadCharacter, saveCharacter, searchCharacters } from "./character-store.js";
+import type { Character, CharacterAssetRole, ContentItem, ContentStatus, Project } from "./types.js";
 
 const app = express();
 const port = Number(process.env.PORT || 2800);
@@ -60,6 +61,39 @@ const handoffSchema = z.object({
   approvalReceipt: z.string().max(1000).optional(),
   dependencies: z.array(z.string().min(1).max(500)).max(100).default([]),
   contentVersion: z.number().int().positive().optional(),
+});
+const characterAssetRoles = ["FACE_LOCK", "HERO_REFERENCE", "OUTFIT", "POSE", "EXPRESSION", "APPROVED_RENDER", "REJECTED", "OTHER"] as const;
+const createCharacterSchema = z.object({
+  characterId: z.string().trim().min(1).max(120).regex(/^[a-zA-Z0-9_-]+$/),
+  clientId: z.string().trim().min(1).max(120),
+  name: z.string().trim().min(1).max(200),
+  aliases: z.array(z.string().trim().min(1).max(200)).max(100).default([]),
+  description: z.string().max(6000).optional(),
+  identityTraits: z.record(z.string(), z.unknown()).default({}),
+  lockedElements: z.array(z.string().min(1).max(500)).max(200).default([]),
+  negativeConstraints: z.array(z.string().min(1).max(500)).max(200).default([]),
+  tags: z.array(z.string().min(1).max(120)).max(200).default([]),
+  relationships: z.array(z.string().min(1).max(200)).max(200).default([]),
+  driveFolderId: z.string().max(300).optional(),
+  driveFolderUrl: z.string().url().optional(),
+});
+const updateCharacterSchema = createCharacterSchema.omit({ characterId: true, clientId: true }).partial().extend({
+  status: z.enum(["DRAFT", "ACTIVE", "ARCHIVED"]).optional(),
+});
+const characterAssetSchema = z.object({
+  driveFileId: z.string().trim().min(1).max(300),
+  driveUrl: z.string().url(),
+  name: z.string().trim().min(1).max(300),
+  mimeType: z.string().max(200).optional(),
+  role: z.enum(characterAssetRoles).default("OTHER"),
+  tags: z.array(z.string().min(1).max(120)).max(200).default([]),
+  notes: z.string().max(4000).optional(),
+  approved: z.boolean().default(false),
+});
+const updateCharacterAssetSchema = characterAssetSchema.omit({ driveFileId: true, driveUrl: true }).partial();
+const characterVersionSchema = z.object({
+  createdBy: z.string().trim().min(1).max(160).default("Oneforall Director"),
+  summary: z.string().trim().min(1).max(4000),
 });
 const summary = (project: Project) => ({
   id: project.id,
@@ -227,6 +261,78 @@ app.post("/api/content-items/:itemId/handoffs", async (req, res, next) => {
     if (/auditor/i.test(input.targetPlugin) || /CHECK/i.test(input.targetNick)) item.status = "READY_FOR_AUDIT";
     await saveContentItem(item);
     res.status(201).json({ itemId: item.itemId, status: item.status, handoff });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/characters", async (req, res, next) => {
+  try {
+    const clientId = typeof req.query.clientId === "string" ? req.query.clientId : undefined;
+    const query = typeof req.query.query === "string" ? req.query.query : undefined;
+    const tags = typeof req.query.tags === "string" ? req.query.tags.split(",").map((tag) => tag.trim()).filter(Boolean) : undefined;
+    res.json({ characters: await searchCharacters({ clientId, query, tags }) });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/characters", async (req, res, next) => {
+  try {
+    const input = createCharacterSchema.parse(req.body);
+    if (await characterExists(input.characterId)) return res.status(409).json({ error: `CHARACTER_ID ${input.characterId} already exists` });
+    const now = new Date().toISOString();
+    const character: Character = { ...input, status: "DRAFT", canonVersion: 0, assets: [], versions: [], createdAt: now, updatedAt: now };
+    await saveCharacter(character);
+    res.status(201).json(character);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/characters/:characterId", async (req, res, next) => {
+  try { res.json(await loadCharacter(req.params.characterId)); } catch (error) { next(error); }
+});
+
+app.patch("/api/characters/:characterId", async (req, res, next) => {
+  try {
+    const character = await loadCharacter(req.params.characterId);
+    Object.assign(character, updateCharacterSchema.parse(req.body));
+    await saveCharacter(character);
+    res.json(character);
+  } catch (error) { next(error); }
+});
+
+app.post("/api/characters/:characterId/assets", async (req, res, next) => {
+  try {
+    const character = await loadCharacter(req.params.characterId);
+    const input = characterAssetSchema.parse(req.body);
+    const duplicate = character.assets.find((asset) => asset.driveFileId === input.driveFileId);
+    if (duplicate) return res.status(409).json({ error: `Drive file ${input.driveFileId} is already attached`, asset: duplicate });
+    const now = new Date().toISOString();
+    const asset = { id: randomUUID(), ...input, role: input.role as CharacterAssetRole, createdAt: now, updatedAt: now };
+    character.assets.push(asset);
+    await saveCharacter(character);
+    res.status(201).json({ characterId: character.characterId, asset });
+  } catch (error) { next(error); }
+});
+
+app.patch("/api/characters/:characterId/assets/:assetId", async (req, res, next) => {
+  try {
+    const character = await loadCharacter(req.params.characterId);
+    const asset = character.assets.find((candidate) => candidate.id === req.params.assetId);
+    if (!asset) return res.status(404).json({ error: `Asset ${req.params.assetId} not found` });
+    Object.assign(asset, updateCharacterAssetSchema.parse(req.body), { updatedAt: new Date().toISOString() });
+    await saveCharacter(character);
+    res.json({ characterId: character.characterId, asset });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/characters/:characterId/versions", async (req, res, next) => {
+  try {
+    const character = await loadCharacter(req.params.characterId);
+    const input = characterVersionSchema.parse(req.body);
+    const version = character.canonVersion + 1;
+    const snapshot = { name: character.name, aliases: character.aliases, description: character.description, identityTraits: character.identityTraits, lockedElements: character.lockedElements, negativeConstraints: character.negativeConstraints, tags: character.tags, relationships: character.relationships, driveFolderId: character.driveFolderId, approvedAssetIds: character.assets.filter((asset) => asset.approved).map((asset) => asset.id) };
+    character.versions.push({ version, createdAt: new Date().toISOString(), createdBy: input.createdBy, summary: input.summary, snapshot });
+    character.canonVersion = version;
+    character.status = "ACTIVE";
+    await saveCharacter(character);
+    res.status(201).json({ characterId: character.characterId, canonVersion: version, status: character.status, version: character.versions.at(-1) });
   } catch (error) { next(error); }
 });
 

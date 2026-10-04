@@ -102,4 +102,25 @@ export const director = {
 
   handoffContentItem: (itemId: string, input: Record<string, unknown>) =>
     request(`/content-items/${encodeURIComponent(itemId)}/handoffs`, { method: "POST", body: JSON.stringify(input) }),
+
+  searchCharacters: (filters: { clientId?: string; query?: string; tags?: string[] }) => {
+    const params = new URLSearchParams();
+    if (filters.clientId) params.set("clientId", filters.clientId);
+    if (filters.query) params.set("query", filters.query);
+    if (filters.tags?.length) params.set("tags", filters.tags.join(","));
+    const suffix = params.size ? `?${params.toString()}` : "";
+    return request(`/characters${suffix}`);
+  },
+  createCharacter: (input: Record<string, unknown>) =>
+    request("/characters", { method: "POST", body: JSON.stringify(input) }),
+  getCharacter: (characterId: string) =>
+    request(`/characters/${encodeURIComponent(characterId)}`),
+  updateCharacter: (characterId: string, input: Record<string, unknown>) =>
+    request(`/characters/${encodeURIComponent(characterId)}`, { method: "PATCH", body: JSON.stringify(input) }),
+  attachCharacterAsset: (characterId: string, input: Record<string, unknown>) =>
+    request(`/characters/${encodeURIComponent(characterId)}/assets`, { method: "POST", body: JSON.stringify(input) }),
+  updateCharacterAsset: (characterId: string, assetId: string, input: Record<string, unknown>) =>
+    request(`/characters/${encodeURIComponent(characterId)}/assets/${encodeURIComponent(assetId)}`, { method: "PATCH", body: JSON.stringify(input) }),
+  createCharacterVersion: (characterId: string, input: Record<string, unknown>) =>
+    request(`/characters/${encodeURIComponent(characterId)}/versions`, { method: "POST", body: JSON.stringify(input) }),
 };

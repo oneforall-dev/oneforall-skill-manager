@@ -110,3 +110,56 @@ export type ContentItem = {
   specialistCalls: SpecialistCall[];
   handoffs: ContentHandoff[];
 };
+
+export type CharacterAssetRole =
+  | "FACE_LOCK"
+  | "HERO_REFERENCE"
+  | "OUTFIT"
+  | "POSE"
+  | "EXPRESSION"
+  | "APPROVED_RENDER"
+  | "REJECTED"
+  | "OTHER";
+
+export type CharacterAsset = {
+  id: string;
+  driveFileId: string;
+  driveUrl: string;
+  name: string;
+  mimeType?: string;
+  role: CharacterAssetRole;
+  tags: string[];
+  notes?: string;
+  approved: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CharacterCanonVersion = {
+  version: number;
+  createdAt: string;
+  createdBy: string;
+  summary: string;
+  snapshot: Record<string, unknown>;
+};
+
+export type Character = {
+  characterId: string;
+  clientId: string;
+  name: string;
+  aliases: string[];
+  status: "DRAFT" | "ACTIVE" | "ARCHIVED";
+  canonVersion: number;
+  description?: string;
+  identityTraits: Record<string, unknown>;
+  lockedElements: string[];
+  negativeConstraints: string[];
+  tags: string[];
+  relationships: string[];
+  driveFolderId?: string;
+  driveFolderUrl?: string;
+  assets: CharacterAsset[];
+  versions: CharacterCanonVersion[];
+  createdAt: string;
+  updatedAt: string;
+};

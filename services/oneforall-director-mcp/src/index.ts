@@ -401,6 +401,103 @@ function buildServer() {
     }
   );
 
+  const assetRoles = ["FACE_LOCK", "HERO_REFERENCE", "OUTFIT", "POSE", "EXPRESSION", "APPROVED_RENDER", "REJECTED", "OTHER"] as const;
+
+  server.registerTool(
+    "search_characters",
+    {
+      title: "Search character vault",
+      description: "Search the persistent Oneforall Character Vault by CLIENT_ID, name, alias, CHARACTER_ID or exact tags. Use before creating content with recurring people, idols or characters.",
+      inputSchema: z.object({ client_id: z.string().min(1).optional(), query: z.string().min(1).optional(), tags: z.array(z.string().min(1)).max(50).optional() }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ client_id, query, tags }) => {
+      try { return textResult(await director.searchCharacters({ clientId: client_id, query, tags })); } catch (e) { return errorResult(e); }
+    }
+  );
+
+  server.registerTool(
+    "create_character",
+    {
+      title: "Create character",
+      description: "Create a persistent CHARACTER_ID and canonical character record. Reference photos can be attached afterward from Google Drive.",
+      inputSchema: z.object({
+        character_id: z.string().min(1).max(120).regex(/^[a-zA-Z0-9_-]+$/), client_id: z.string().min(1).max(120), name: z.string().min(1).max(200), aliases: z.array(z.string()).max(100).default([]), description: z.string().max(6000).optional(), identity_traits: z.record(z.string(), z.unknown()).default({}), locked_elements: z.array(z.string()).max(200).default([]), negative_constraints: z.array(z.string()).max(200).default([]), tags: z.array(z.string()).max(200).default([]), relationships: z.array(z.string()).max(200).default([]), drive_folder_id: z.string().max(300).optional(), drive_folder_url: z.string().url().optional(),
+      }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ character_id, client_id, name, aliases, description, identity_traits, locked_elements, negative_constraints, tags, relationships, drive_folder_id, drive_folder_url }) => {
+      try { return textResult(await director.createCharacter({ characterId: character_id, clientId: client_id, name, aliases, description, identityTraits: identity_traits, lockedElements: locked_elements, negativeConstraints: negative_constraints, tags, relationships, driveFolderId: drive_folder_id, driveFolderUrl: drive_folder_url })); } catch (e) { return errorResult(e); }
+    }
+  );
+
+  server.registerTool(
+    "get_character",
+    {
+      title: "Get character",
+      description: "Retrieve canonical identity, Face Lock references, approved assets, constraints and version history for one CHARACTER_ID.",
+      inputSchema: z.object({ character_id: z.string().min(1) }), outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ character_id }) => { try { return textResult(await director.getCharacter(character_id)); } catch (e) { return errorResult(e); } }
+  );
+
+  server.registerTool(
+    "update_character",
+    {
+      title: "Update character",
+      description: "Update a character draft without changing CHARACTER_ID. Create a canon version after material changes are reviewed.",
+      inputSchema: z.object({ character_id: z.string().min(1), name: z.string().min(1).max(200).optional(), aliases: z.array(z.string()).max(100).optional(), status: z.enum(["DRAFT", "ACTIVE", "ARCHIVED"]).optional(), description: z.string().max(6000).optional(), identity_traits: z.record(z.string(), z.unknown()).optional(), locked_elements: z.array(z.string()).max(200).optional(), negative_constraints: z.array(z.string()).max(200).optional(), tags: z.array(z.string()).max(200).optional(), relationships: z.array(z.string()).max(200).optional(), drive_folder_id: z.string().max(300).optional(), drive_folder_url: z.string().url().optional() }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ character_id, identity_traits, locked_elements, negative_constraints, drive_folder_id, drive_folder_url, ...changes }) => {
+      try { const input: Record<string, unknown> = { ...changes }; if (identity_traits) input.identityTraits = identity_traits; if (locked_elements) input.lockedElements = locked_elements; if (negative_constraints) input.negativeConstraints = negative_constraints; if (drive_folder_id) input.driveFolderId = drive_folder_id; if (drive_folder_url) input.driveFolderUrl = drive_folder_url; return textResult(await director.updateCharacter(character_id, input)); } catch (e) { return errorResult(e); }
+    }
+  );
+
+  server.registerTool(
+    "attach_character_asset",
+    {
+      title: "Attach character reference",
+      description: "Attach and tag a Google Drive image or other reference to a CHARACTER_ID. The tool stores the Drive identity and analysis metadata, not the binary file.",
+      inputSchema: z.object({ character_id: z.string().min(1), drive_file_id: z.string().min(1), drive_url: z.string().url(), name: z.string().min(1).max(300), mime_type: z.string().max(200).optional(), role: z.enum(assetRoles).default("OTHER"), tags: z.array(z.string()).max(200).default([]), notes: z.string().max(4000).optional(), approved: z.boolean().default(false) }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ character_id, drive_file_id, drive_url, name, mime_type, role, tags, notes, approved }) => {
+      try { return textResult(await director.attachCharacterAsset(character_id, { driveFileId: drive_file_id, driveUrl: drive_url, name, mimeType: mime_type, role, tags, notes, approved })); } catch (e) { return errorResult(e); }
+    }
+  );
+
+  server.registerTool(
+    "update_character_asset",
+    {
+      title: "Update character reference",
+      description: "Approve, reject, retag or reclassify an attached character asset without changing its Drive identity.",
+      inputSchema: z.object({ character_id: z.string().min(1), asset_id: z.string().uuid(), name: z.string().min(1).max(300).optional(), mime_type: z.string().max(200).optional(), role: z.enum(assetRoles).optional(), tags: z.array(z.string()).max(200).optional(), notes: z.string().max(4000).optional(), approved: z.boolean().optional() }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ character_id, asset_id, mime_type, ...changes }) => {
+      try { const input: Record<string, unknown> = { ...changes }; if (mime_type) input.mimeType = mime_type; return textResult(await director.updateCharacterAsset(character_id, asset_id, input)); } catch (e) { return errorResult(e); }
+    }
+  );
+
+  server.registerTool(
+    "create_character_version",
+    {
+      title: "Create character canon version",
+      description: "Freeze the current canonical character data and approved asset IDs as a traceable version, then mark the character ACTIVE.",
+      inputSchema: z.object({ character_id: z.string().min(1), summary: z.string().min(1).max(4000), created_by: z.string().min(1).max(160).default("Oneforall Director") }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ character_id, summary, created_by }) => { try { return textResult(await director.createCharacterVersion(character_id, { summary, createdBy: created_by })); } catch (e) { return errorResult(e); } }
+  );
+
   return server;
 }
 
