@@ -42,6 +42,25 @@ function serviceAccount(): ServiceAccount {
 
 async function accessToken() {
   if (tokenCache && tokenCache.expiresAt > Date.now() + 60_000) return tokenCache.accessToken;
+  const oauthClientId = process.env.GOOGLE_DRIVE_OAUTH_CLIENT_ID;
+  const oauthClientSecret = process.env.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET;
+  const oauthRefreshToken = process.env.GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN;
+  if (oauthClientId && oauthClientSecret && oauthRefreshToken) {
+    const response = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: oauthClientId,
+        client_secret: oauthClientSecret,
+        refresh_token: oauthRefreshToken,
+        grant_type: "refresh_token",
+      }),
+    });
+    if (!response.ok) throw new Error(`Google OAuth refresh failed (${response.status}): ${await response.text()}`);
+    const body = await response.json() as { access_token: string; expires_in?: number };
+    tokenCache = { accessToken: body.access_token, expiresAt: Date.now() + (body.expires_in || 3600) * 1000 };
+    return body.access_token;
+  }
   const account = serviceAccount();
   const now = Math.floor(Date.now() / 1000);
   const header = base64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
@@ -191,8 +210,15 @@ export function scanCharacterVault(source: "manual" | "automatic" = "manual") {
 }
 
 export function characterVaultScannerStatus() {
+  const oauthConfigured = Boolean(
+    process.env.GOOGLE_DRIVE_OAUTH_CLIENT_ID
+    && process.env.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET
+    && process.env.GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN,
+  );
+  const serviceAccountConfigured = Boolean(process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON_BASE64);
   return {
-    configured: Boolean((process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON_BASE64) && process.env.CHARACTER_VAULT_INBOX_FOLDER_ID),
+    configured: Boolean((oauthConfigured || serviceAccountConfigured) && process.env.CHARACTER_VAULT_INBOX_FOLDER_ID),
+    authentication: oauthConfigured ? "oauth" : serviceAccountConfigured ? "service_account" : "none",
     running: Boolean(scanPromise),
     intervalMinutes: Number(process.env.CHARACTER_VAULT_SCAN_INTERVAL_MINUTES || 15),
     lastScan,
