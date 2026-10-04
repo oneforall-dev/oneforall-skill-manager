@@ -36,6 +36,7 @@ jobs:
           context: services/${{ matrix.service }}
           push: true
           tags: |
+            ghcr.io/oneforall-dev/${{ matrix.image }}:character-vault-auto-scan-2026-10-04
             ghcr.io/oneforall-dev/${{ matrix.image }}:character-vault-2026-10-03
             ghcr.io/oneforall-dev/${{ matrix.image }}:creative-owner-2026-09-30
             ghcr.io/oneforall-dev/${{ matrix.image }}:latest

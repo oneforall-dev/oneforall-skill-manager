@@ -404,6 +404,30 @@ function buildServer() {
   const assetRoles = ["FACE_LOCK", "HERO_REFERENCE", "OUTFIT", "POSE", "EXPRESSION", "APPROVED_RENDER", "REJECTED", "OTHER"] as const;
 
   server.registerTool(
+    "get_character_vault_scanner_status",
+    {
+      title: "Get Character Vault scanner status",
+      description: "Check whether automatic Google Drive scanning is configured or running and inspect the last completed scan.",
+      inputSchema: z.object({}),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async () => { try { return textResult(await director.getCharacterVaultScannerStatus()); } catch (e) { return errorResult(e); } }
+  );
+
+  server.registerTool(
+    "scan_character_vault",
+    {
+      title: "Scan Character Vault now",
+      description: "Manually scan 00_INBOX_UPLOADS/Clients/{CLIENT_ID}/{GROUP_OR_PROJECT}/Aidols/{PERSONA}, create missing DRAFT character records and attach new images as unapproved OTHER references. Idempotent; never approves Face Locks or creates canon versions.",
+      inputSchema: z.object({}),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async () => { try { return textResult(await director.scanCharacterVault()); } catch (e) { return errorResult(e); } }
+  );
+
+  server.registerTool(
     "search_characters",
     {
       title: "Search character vault",

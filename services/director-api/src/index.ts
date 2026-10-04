@@ -5,6 +5,7 @@ import { analyze, buildPlan, render } from "./media.js";
 import { ensureProjectDirs, listProjects, loadProject, saveProject } from "./store.js";
 import { contentItemExists, listContentItems, loadContentItem, saveContentItem } from "./content-store.js";
 import { characterExists, loadCharacter, saveCharacter, searchCharacters } from "./character-store.js";
+import { characterVaultScannerStatus, scanCharacterVault, startCharacterVaultScanner } from "./character-vault-scanner.js";
 import type { Character, CharacterAssetRole, ContentItem, ContentStatus, Project } from "./types.js";
 
 const app = express();
@@ -336,9 +337,18 @@ app.post("/api/characters/:characterId/versions", async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+app.get("/api/character-vault/scanner", (_req, res) => res.json(characterVaultScannerStatus()));
+
+app.post("/api/character-vault/scan", async (_req, res, next) => {
+  try { res.json(await scanCharacterVault("manual")); } catch (error) { next(error); }
+});
+
 app.use((error: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   const status = error?.statusCode || (error instanceof z.ZodError ? 400 : 500);
   res.status(status).json({ error: error?.message || "Internal server error", details: error instanceof z.ZodError ? error.issues : undefined });
 });
 
-app.listen(port, "0.0.0.0", () => console.log(`Oneforall Director API listening on ${port}`));
+app.listen(port, "0.0.0.0", () => {
+  console.log(`Oneforall Director API listening on ${port}`);
+  startCharacterVaultScanner();
+});
