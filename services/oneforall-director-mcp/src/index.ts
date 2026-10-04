@@ -71,7 +71,7 @@ function buildServer() {
     },
     {
       instructions:
-        "Tools for Oneforall Director creative ownership and video production. Manage persistent content items, versions, specialist calls, results and Auditor handoffs, plus create, inspect, analyze, plan, render and revise video projects. Preserve ITEM_ID and never claim another agent executed work without a recorded result.",
+        "Tools for Oneforall Director creative ownership and video production. Manage persistent content items, versions, specialist calls, results and Auditor handoffs, plus create, inspect, analyze, plan, render and revise video projects. Preserve ITEM_ID and never claim another agent executed work without a recorded result. For every recurring character stored in the Character Vault, first resolve the character with search_characters and get_character, then generate through generate_character_image. That tool sends the approved FACE_LOCK and HERO_REFERENCE image bytes to the image model. Never use a host or general-purpose image generator, and never fall back to a text-only prompt, for a vaulted recurring character. If generate_character_image cannot load an approved FACE_LOCK, stop and report the error instead of generating a substitute person.",
     }
   );
 
