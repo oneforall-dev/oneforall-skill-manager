@@ -123,6 +123,8 @@ export const director = {
     request(`/characters/${encodeURIComponent(characterId)}/assets/${encodeURIComponent(assetId)}`, { method: "PATCH", body: JSON.stringify(input) }),
   createCharacterVersion: (characterId: string, input: Record<string, unknown>) =>
     request(`/characters/${encodeURIComponent(characterId)}/versions`, { method: "POST", body: JSON.stringify(input) }),
+  generateCharacterImage: (characterId: string, input: Record<string, unknown>) =>
+    request(`/characters/${encodeURIComponent(characterId)}/generate-image`, { method: "POST", body: JSON.stringify(input) }),
   getCharacterVaultScannerStatus: () => request("/character-vault/scanner"),
   scanCharacterVault: () => request("/character-vault/scan", { method: "POST" }),
 };

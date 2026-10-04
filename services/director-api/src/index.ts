@@ -5,7 +5,7 @@ import { analyze, buildPlan, render } from "./media.js";
 import { ensureProjectDirs, listProjects, loadProject, saveProject } from "./store.js";
 import { contentItemExists, listContentItems, loadContentItem, saveContentItem } from "./content-store.js";
 import { characterExists, loadCharacter, saveCharacter, searchCharacters } from "./character-store.js";
-import { characterVaultScannerStatus, scanCharacterVault, startCharacterVaultScanner } from "./character-vault-scanner.js";
+import { characterVaultScannerStatus, downloadDriveImage, scanCharacterVault, startCharacterVaultScanner } from "./character-vault-scanner.js";
 import type { Character, CharacterAssetRole, ContentItem, ContentStatus, Project } from "./types.js";
 
 const app = express();
@@ -92,6 +92,11 @@ const characterAssetSchema = z.object({
   approved: z.boolean().default(false),
 });
 const updateCharacterAssetSchema = characterAssetSchema.omit({ driveFileId: true, driveUrl: true }).partial();
+const generateCharacterImageSchema = z.object({
+  prompt: z.string().trim().min(1).max(12000),
+  size: z.enum(["1024x1024", "1024x1536", "1536x1024"]).default("1024x1536"),
+  quality: z.enum(["low", "medium", "high"]).default("high"),
+});
 const characterVersionSchema = z.object({
   createdBy: z.string().trim().min(1).max(160).default("Oneforall Director"),
   summary: z.string().trim().min(1).max(4000),
@@ -334,6 +339,70 @@ app.post("/api/characters/:characterId/versions", async (req, res, next) => {
     character.status = "ACTIVE";
     await saveCharacter(character);
     res.status(201).json({ characterId: character.characterId, canonVersion: version, status: character.status, version: character.versions.at(-1) });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/characters/:characterId/generate-image", async (req, res, next) => {
+  try {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return res.status(503).json({ error: "OPENAI_API_KEY is required for character image generation" });
+
+    const character = await loadCharacter(req.params.characterId);
+    const input = generateCharacterImageSchema.parse(req.body);
+    const references = character.assets
+      .filter((asset) => asset.approved && (asset.role === "FACE_LOCK" || asset.role === "HERO_REFERENCE"))
+      .sort((a, b) => Number(a.role !== "FACE_LOCK") - Number(b.role !== "FACE_LOCK"))
+      .slice(0, 6);
+    const faceLocks = references.filter((asset) => asset.role === "FACE_LOCK");
+    if (!faceLocks.length) {
+      return res.status(409).json({ error: `Character ${character.characterId} has no approved FACE_LOCK; generation blocked` });
+    }
+
+    const form = new FormData();
+    form.set("model", process.env.OPENAI_IMAGE_MODEL || "gpt-image-2");
+    form.set("size", input.size);
+    form.set("quality", input.quality);
+    form.set("output_format", "png");
+    form.set(
+      "prompt",
+      [
+        `EDIT the supplied canonical reference images to create the requested scene with the same person: ${character.name}.`,
+        "Identity preservation is the highest priority. Preserve the exact face, facial proportions, eyes, nose, mouth, jaw, skin tone, apparent age and canonical hair. Do not substitute a lookalike or redesign the person.",
+        `Locked elements: ${character.lockedElements.join("; ") || "preserve all visible canonical identity traits"}.`,
+        `Negative constraints: ${character.negativeConstraints.join("; ") || "no identity drift, no face replacement, no plastic skin"}.`,
+        `Requested scene: ${input.prompt}`,
+      ].join("\n"),
+    );
+
+    for (const [index, asset] of references.entries()) {
+      const image = await downloadDriveImage(asset.driveFileId);
+      form.append("image[]", new Blob([image.bytes], { type: image.mimeType }), asset.name || `reference-${index + 1}.png`);
+    }
+
+    const response = await fetch("https://api.openai.com/v1/images/edits", {
+      method: "POST",
+      headers: { authorization: `Bearer ${apiKey}` },
+      body: form,
+      signal: AbortSignal.timeout(Number(process.env.OPENAI_IMAGE_TIMEOUT_MS || 300000)),
+    });
+    const requestId = response.headers.get("x-request-id") || undefined;
+    const body = await response.json() as { data?: Array<{ b64_json?: string }>; error?: { message?: string; code?: string } };
+    if (!response.ok) {
+      throw Object.assign(new Error(`OpenAI image edit failed (${response.status}): ${body.error?.message || "unknown error"}`), { statusCode: response.status });
+    }
+    const imageBase64 = body.data?.[0]?.b64_json;
+    if (!imageBase64) throw new Error("OpenAI image edit returned no image data");
+
+    res.json({
+      characterId: character.characterId,
+      characterName: character.name,
+      canonVersion: character.canonVersion,
+      model: process.env.OPENAI_IMAGE_MODEL || "gpt-image-2",
+      referenceAssets: references.map((asset) => ({ id: asset.id, name: asset.name, role: asset.role })),
+      mimeType: "image/png",
+      imageBase64,
+      requestId,
+    });
   } catch (error) { next(error); }
 });
 

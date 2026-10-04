@@ -85,6 +85,24 @@ async function accessToken() {
   return body.access_token;
 }
 
+export async function downloadDriveImage(fileId: string) {
+  const response = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`,
+    { headers: { authorization: `Bearer ${await accessToken()}` } },
+  );
+  if (!response.ok) {
+    throw new Error(`Drive image download failed (${response.status}): ${await response.text()}`);
+  }
+  const mimeType = (response.headers.get("content-type") || "application/octet-stream").split(";")[0].trim();
+  if (!mimeType.startsWith("image/")) {
+    throw new Error(`Drive file ${fileId} is not an image (${mimeType})`);
+  }
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (!bytes.length) throw new Error(`Drive image ${fileId} is empty`);
+  if (bytes.length > 50 * 1024 * 1024) throw new Error(`Drive image ${fileId} exceeds the 50 MB edit limit`);
+  return { bytes, mimeType };
+}
+
 async function listChildren(parentId: string): Promise<DriveItem[]> {
   const items: DriveItem[] = [];
   let pageToken: string | undefined;

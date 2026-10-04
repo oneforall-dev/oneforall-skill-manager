@@ -47,6 +47,22 @@ function errorResult(error: unknown) {
   };
 }
 
+function generatedImageResult(data: unknown) {
+  const value = data as Record<string, unknown>;
+  const imageBase64 = value.imageBase64;
+  const mimeType = typeof value.mimeType === "string" ? value.mimeType : "image/png";
+  if (typeof imageBase64 !== "string" || !imageBase64) throw new Error("Director API returned no generated image");
+  const metadata = { ...value };
+  delete metadata.imageBase64;
+  return {
+    structuredContent: { data: metadata },
+    content: [
+      { type: "text" as const, text: JSON.stringify(metadata, null, 2) },
+      { type: "image" as const, data: imageBase64, mimeType },
+    ],
+  };
+}
+
 function buildServer() {
   const server = new McpServer(
     {
@@ -520,6 +536,25 @@ function buildServer() {
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ character_id, summary, created_by }) => { try { return textResult(await director.createCharacterVersion(character_id, { summary, createdBy: created_by })); } catch (e) { return errorResult(e); } }
+  );
+
+  server.registerTool(
+    "generate_character_image",
+    {
+      title: "Generate canon-locked character image",
+      description: "Generate an image of a recurring character by downloading the approved FACE_LOCK and HERO_REFERENCE assets and sending the actual image bytes to OpenAI's image edit endpoint. This is the only permitted generation path for a vaulted recurring character. It fails closed when no approved FACE_LOCK can be loaded; never replace it with text-only generation.",
+      inputSchema: z.object({
+        character_id: z.string().min(1),
+        prompt: z.string().min(1).max(12000),
+        size: z.enum(["1024x1024", "1024x1536", "1536x1024"]).default("1024x1536"),
+        quality: z.enum(["low", "medium", "high"]).default("high"),
+      }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ character_id, prompt, size, quality }) => {
+      try { return generatedImageResult(await director.generateCharacterImage(character_id, { prompt, size, quality })); } catch (e) { return errorResult(e); }
+    },
   );
 
   return server;
