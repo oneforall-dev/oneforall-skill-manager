@@ -47,18 +47,22 @@ function errorResult(error: unknown) {
   };
 }
 
-function generatedImageResult(data: unknown) {
+function characterReferencesResult(data: unknown) {
   const value = data as Record<string, unknown>;
-  const imageBase64 = value.imageBase64;
-  const mimeType = typeof value.mimeType === "string" ? value.mimeType : "image/png";
-  if (typeof imageBase64 !== "string" || !imageBase64) throw new Error("Director API returned no generated image");
+  const images = Array.isArray(value.images) ? value.images as Array<Record<string, unknown>> : [];
+  if (!images.length) throw new Error("Director API returned no character reference images");
   const metadata = { ...value };
-  delete metadata.imageBase64;
+  delete metadata.images;
+  const referenceAssets = images.map(({ imageBase64: _imageBase64, ...image }) => image);
   return {
-    structuredContent: { data: metadata },
+    structuredContent: { data: { ...metadata, referenceAssets } },
     content: [
-      { type: "text" as const, text: JSON.stringify(metadata, null, 2) },
-      { type: "image" as const, data: imageBase64, mimeType },
+      { type: "text" as const, text: JSON.stringify({ ...metadata, referenceAssets }, null, 2) },
+      ...images.map((image) => ({
+        type: "image" as const,
+        data: String(image.imageBase64 || ""),
+        mimeType: typeof image.mimeType === "string" ? image.mimeType : "image/png",
+      })),
     ],
   };
 }
@@ -71,7 +75,7 @@ function buildServer() {
     },
     {
       instructions:
-        "Tools for Oneforall Director creative ownership and video production. Manage persistent content items, versions, specialist calls, results and Auditor handoffs, plus create, inspect, analyze, plan, render and revise video projects. Preserve ITEM_ID and never claim another agent executed work without a recorded result. For every recurring character stored in the Character Vault, first resolve the character with search_characters and get_character, then generate through generate_character_image. That tool sends the approved FACE_LOCK and HERO_REFERENCE image bytes to the image model. Never use a host or general-purpose image generator, and never fall back to a text-only prompt, for a vaulted recurring character. If generate_character_image cannot load an approved FACE_LOCK, stop and report the error instead of generating a substitute person.",
+        "Tools for Oneforall Director creative ownership and video production. Manage persistent content items, versions, specialist calls, results and Auditor handoffs, plus create, inspect, analyze, plan, render and revise video projects. Preserve ITEM_ID and never claim another agent executed work without a recorded result. For every recurring character stored in the Character Vault, first call search_characters and get_character, then call load_character_references. That tool returns the approved FACE_LOCK and HERO_REFERENCE as actual image content. Only after those images are present, use ChatGPT's built-in image generator with them as reference inputs. Never generate from character metadata or a text-only prompt. If load_character_references cannot load an approved FACE_LOCK, stop and report the error instead of generating a substitute person.",
     }
   );
 
@@ -539,21 +543,16 @@ function buildServer() {
   );
 
   server.registerTool(
-    "generate_character_image",
+    "load_character_references",
     {
-      title: "Generate canon-locked character image",
-      description: "Generate an image of a recurring character by downloading the approved FACE_LOCK and HERO_REFERENCE assets and sending the actual image bytes to OpenAI's image edit endpoint. This is the only permitted generation path for a vaulted recurring character. It fails closed when no approved FACE_LOCK can be loaded; never replace it with text-only generation.",
-      inputSchema: z.object({
-        character_id: z.string().min(1),
-        prompt: z.string().min(1).max(12000),
-        size: z.enum(["1024x1024", "1024x1536", "1536x1024"]).default("1024x1536"),
-        quality: z.enum(["low", "medium", "high"]).default("high"),
-      }),
+      title: "Load canonical character reference images",
+      description: "Load approved FACE_LOCK and HERO_REFERENCE files as actual image content for ChatGPT's built-in image generator. Required before generating any vaulted recurring character. Fails closed when no approved FACE_LOCK exists; never replace these inputs with metadata or a text-only prompt.",
+      inputSchema: z.object({ character_id: z.string().min(1) }),
       outputSchema: wrappedOutputSchema,
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
     },
-    async ({ character_id, prompt, size, quality }) => {
-      try { return generatedImageResult(await director.generateCharacterImage(character_id, { prompt, size, quality })); } catch (e) { return errorResult(e); }
+    async ({ character_id }) => {
+      try { return characterReferencesResult(await director.loadCharacterReferences(character_id)); } catch (e) { return errorResult(e); }
     },
   );
 
