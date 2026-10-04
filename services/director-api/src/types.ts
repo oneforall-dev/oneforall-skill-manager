@@ -114,6 +114,7 @@ export type ContentItem = {
 export type CharacterAssetRole =
   | "FACE_LOCK"
   | "HERO_REFERENCE"
+  | "CHAR_SHEET"
   | "OUTFIT"
   | "POSE"
   | "EXPRESSION"

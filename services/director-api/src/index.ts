@@ -63,7 +63,7 @@ const handoffSchema = z.object({
   dependencies: z.array(z.string().min(1).max(500)).max(100).default([]),
   contentVersion: z.number().int().positive().optional(),
 });
-const characterAssetRoles = ["FACE_LOCK", "HERO_REFERENCE", "OUTFIT", "POSE", "EXPRESSION", "APPROVED_RENDER", "REJECTED", "OTHER"] as const;
+const characterAssetRoles = ["FACE_LOCK", "HERO_REFERENCE", "CHAR_SHEET", "OUTFIT", "POSE", "EXPRESSION", "APPROVED_RENDER", "REJECTED", "OTHER"] as const;
 const createCharacterSchema = z.object({
   characterId: z.string().trim().min(1).max(120).regex(/^[a-zA-Z0-9_-]+$/),
   clientId: z.string().trim().min(1).max(120),
@@ -341,8 +341,8 @@ app.get("/api/characters/:characterId/reference-images", async (req, res, next) 
   try {
     const character = await loadCharacter(req.params.characterId);
     const references = character.assets
-      .filter((asset) => asset.approved && (asset.role === "FACE_LOCK" || asset.role === "HERO_REFERENCE"))
-      .sort((a, b) => Number(a.role !== "FACE_LOCK") - Number(b.role !== "FACE_LOCK"))
+      .filter((asset) => asset.approved && (asset.role === "FACE_LOCK" || asset.role === "HERO_REFERENCE" || asset.role === "CHAR_SHEET"))
+      .sort((a, b) => ["FACE_LOCK", "HERO_REFERENCE", "CHAR_SHEET"].indexOf(a.role) - ["FACE_LOCK", "HERO_REFERENCE", "CHAR_SHEET"].indexOf(b.role))
       .slice(0, 6);
     const faceLocks = references.filter((asset) => asset.role === "FACE_LOCK");
     if (!faceLocks.length) {

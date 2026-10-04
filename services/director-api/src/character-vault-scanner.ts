@@ -1,10 +1,11 @@
 import { createSign, randomUUID } from "node:crypto";
 import { characterExists, loadCharacter, saveCharacter, searchCharacters } from "./character-store.js";
-import type { Character } from "./types.js";
+import type { Character, CharacterAssetRole } from "./types.js";
 
 const folderMime = "application/vnd.google-apps.folder";
 
 type DriveItem = { id: string; name: string; mimeType: string; webViewLink?: string };
+type DriveImage = DriveItem & { folderNames: string[] };
 type ServiceAccount = { client_email: string; private_key: string; token_uri?: string };
 
 export type VaultScanResult = {
@@ -17,6 +18,7 @@ export type VaultScanResult = {
   charactersCreated: number;
   charactersUpdated: number;
   assetsAdded: number;
+  assetsUpdated: number;
   assetsSkipped: number;
   warnings: string[];
 };
@@ -127,10 +129,15 @@ async function listChildren(parentId: string): Promise<DriveItem[]> {
   return items;
 }
 
-async function listImagesRecursively(folderId: string): Promise<DriveItem[]> {
+async function listImagesRecursively(folderId: string, folderNames: string[] = []): Promise<DriveImage[]> {
   const children = await listChildren(folderId);
-  const nested = await Promise.all(children.filter((item) => item.mimeType === folderMime).map((item) => listImagesRecursively(item.id)));
-  return [...children.filter((item) => item.mimeType.startsWith("image/")), ...nested.flat()];
+  const nested = await Promise.all(children
+    .filter((item) => item.mimeType === folderMime)
+    .map((item) => listImagesRecursively(item.id, [...folderNames, item.name])));
+  return [
+    ...children.filter((item) => item.mimeType.startsWith("image/")).map((item) => ({ ...item, folderNames })),
+    ...nested.flat(),
+  ];
 }
 
 function slug(value: string) {
@@ -139,6 +146,43 @@ function slug(value: string) {
 
 function characterId(client: string, project: string, person: string) {
   return [client, project, person].map(slug).filter(Boolean).join("-").slice(0, 120);
+}
+
+function classificationText(image: DriveImage) {
+  return [...image.folderNames, image.name.replace(/\.[^.]+$/, "")]
+    .join(" ")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/[^a-zA-Z0-9]+/g, " ")
+    .toLowerCase()
+    .trim();
+}
+
+function inferAssetRole(image: DriveImage): CharacterAssetRole {
+  const value = classificationText(image);
+  if (/\b(face lock|facelock|identity lock|identity reference)\b/.test(value)) return "FACE_LOCK";
+  if (/\b(character sheet|char sheet|charsheet|turnaround|model sheet)\b/.test(value)) return "CHAR_SHEET";
+  if (/\b(hero reference|hero ref|hero)\b/.test(value)) return "HERO_REFERENCE";
+  if (/\b(expression|expressions)\b/.test(value)) return "EXPRESSION";
+  if (/\b(outfit|wardrobe|look)\b/.test(value)) return "OUTFIT";
+  if (/\b(pose|poses)\b/.test(value)) return "POSE";
+  return "OTHER";
+}
+
+function canonicalSnapshot(character: Character) {
+  return {
+    name: character.name,
+    aliases: character.aliases,
+    description: character.description,
+    identityTraits: character.identityTraits,
+    lockedElements: character.lockedElements,
+    negativeConstraints: character.negativeConstraints,
+    tags: character.tags,
+    relationships: character.relationships,
+    driveFolderId: character.driveFolderId,
+    approvedAssetIds: character.assets.filter((asset) => asset.approved).map((asset) => asset.id),
+  };
 }
 
 async function importPerson(client: DriveItem, project: DriveItem, person: DriveItem, result: VaultScanResult) {
@@ -175,9 +219,24 @@ async function importPerson(client: DriveItem, project: DriveItem, person: Drive
     result.charactersCreated += 1;
   }
 
-  const existing = new Set(character.assets.map((asset) => asset.driveFileId));
+  const existing = new Map(character.assets.map((asset) => [asset.driveFileId, asset]));
   for (const image of await listImagesRecursively(person.id)) {
-    if (existing.has(image.id)) { result.assetsSkipped += 1; continue; }
+    const inferredRole = inferAssetRole(image);
+    const inferredApproved = inferredRole !== "OTHER";
+    const current = existing.get(image.id);
+    if (current) {
+      if (current.role === "OTHER" && !current.approved && inferredApproved) {
+        current.role = inferredRole;
+        current.approved = true;
+        current.tags = [...new Set([...current.tags, "auto-classified", `role:${inferredRole}`])];
+        current.notes = `Auto-classified as ${inferredRole} from Drive filename or folder.`;
+        current.updatedAt = new Date().toISOString();
+        result.assetsUpdated += 1;
+      } else {
+        result.assetsSkipped += 1;
+      }
+      continue;
+    }
     const now = new Date().toISOString();
     character.assets.push({
       id: randomUUID(),
@@ -185,14 +244,31 @@ async function importPerson(client: DriveItem, project: DriveItem, person: Drive
       driveUrl: image.webViewLink || `https://drive.google.com/file/d/${image.id}/view`,
       name: image.name,
       mimeType: image.mimeType,
-      role: "OTHER",
-      tags: ["auto-imported", `project:${project.name}`],
-      notes: "Imported automatically from Character Vault; pending review and classification.",
-      approved: false,
+      role: inferredRole,
+      tags: ["auto-imported", `project:${project.name}`, ...(inferredApproved ? ["auto-classified", `role:${inferredRole}`] : [])],
+      notes: inferredApproved
+        ? `Imported and auto-classified as ${inferredRole} from Drive filename or folder.`
+        : "Imported automatically from Character Vault; pending review and classification.",
+      approved: inferredApproved,
       createdAt: now,
       updatedAt: now,
     });
     result.assetsAdded += 1;
+  }
+
+  const hasApprovedFaceLock = character.assets.some((asset) => asset.approved && asset.role === "FACE_LOCK");
+  if (hasApprovedFaceLock && character.canonVersion === 0) {
+    const now = new Date().toISOString();
+    const version = 1;
+    character.versions.push({
+      version,
+      createdAt: now,
+      createdBy: "Character Vault Scanner",
+      summary: "Activated canonical character from automatically classified Drive references.",
+      snapshot: canonicalSnapshot(character),
+    });
+    character.canonVersion = version;
+    character.status = "ACTIVE";
   }
   await saveCharacter(character);
 }
@@ -201,7 +277,7 @@ async function performScan(source: "manual" | "automatic") {
   const rootId = process.env.CHARACTER_VAULT_INBOX_FOLDER_ID;
   if (!rootId) throw new Error("Google Drive scanner is not configured: missing CHARACTER_VAULT_INBOX_FOLDER_ID");
   const startedAt = new Date().toISOString();
-  const result: VaultScanResult = { startedAt, completedAt: startedAt, source, clients: 0, projects: 0, people: 0, charactersCreated: 0, charactersUpdated: 0, assetsAdded: 0, assetsSkipped: 0, warnings: [] };
+  const result: VaultScanResult = { startedAt, completedAt: startedAt, source, clients: 0, projects: 0, people: 0, charactersCreated: 0, charactersUpdated: 0, assetsAdded: 0, assetsUpdated: 0, assetsSkipped: 0, warnings: [] };
   const rootChildren = await listChildren(rootId);
   const clientsFolder = rootChildren.find((item) => item.mimeType === folderMime && item.name.toLowerCase() === "clients");
   const clientFolders = (clientsFolder ? await listChildren(clientsFolder.id) : rootChildren).filter((item) => item.mimeType === folderMime);
