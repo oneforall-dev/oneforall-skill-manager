@@ -71,7 +71,7 @@ function buildServer() {
   const server = new McpServer(
     {
       name: "oneforall-director",
-      version: "1.0.0",
+      version: "1.1.0",
     },
     {
       instructions:
@@ -421,6 +421,48 @@ function buildServer() {
     }
   );
 
+  server.registerTool(
+    "get_audit_job",
+    {
+      title: "Get automatic Auditor job",
+      description: "Read the durable real Auditor execution state for one exact Director ITEM_ID and CONTENT_VERSION, including PASS/CORRECTIONS evidence and Publisher receipt registration state.",
+      inputSchema: z.object({ item_id: z.string().min(1), content_version: z.number().int().positive() }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ item_id, content_version }) => {
+      try { return textResult(await director.getAuditJob(item_id, content_version)); } catch (e) { return errorResult(e); }
+    }
+  );
+
+  server.registerTool(
+    "dispatch_audit_job",
+    {
+      title: "Dispatch automatic Auditor job",
+      description: "Idempotently dispatch the real Auditor worker for an exact existing READY_FOR_AUDIT version. Intended for pre-deployment pending items; new READY_FOR_AUDIT transitions dispatch automatically.",
+      inputSchema: z.object({ item_id: z.string().min(1), content_version: z.number().int().positive() }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ item_id, content_version }) => {
+      try { return textResult(await director.dispatchAuditJob(item_id, content_version)); } catch (e) { return errorResult(e); }
+    }
+  );
+
+  server.registerTool(
+    "retry_audit_job",
+    {
+      title: "Retry blocked automatic Auditor job",
+      description: "Requeue a blocked or exhausted Auditor job for the unchanged current version after its real technical dependency has been repaired. Completed identical versions cannot be repeated.",
+      inputSchema: z.object({ item_id: z.string().min(1), content_version: z.number().int().positive() }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ item_id, content_version }) => {
+      try { return textResult(await director.retryAuditJob(item_id, content_version)); } catch (e) { return errorResult(e); }
+    }
+  );
+
   const assetRoles = ["FACE_LOCK", "HERO_REFERENCE", "CHAR_SHEET", "OUTFIT", "POSE", "EXPRESSION", "APPROVED_RENDER", "REJECTED", "OTHER"] as const;
 
   server.registerTool(
@@ -563,6 +605,8 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "oneforall-director-mcp",
+    version: "1.1.0",
+    features: ["automatic-auditor-jobs", "audit-deduplication", "bounded-audit-retries", "publisher-version-reconciliation"],
   });
 });
 

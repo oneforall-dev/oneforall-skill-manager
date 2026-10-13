@@ -103,6 +103,15 @@ export const director = {
   handoffContentItem: (itemId: string, input: Record<string, unknown>) =>
     request(`/content-items/${encodeURIComponent(itemId)}/handoffs`, { method: "POST", body: JSON.stringify(input) }),
 
+  getAuditJob: (itemId: string, contentVersion: number) =>
+    request(`/content-items/${encodeURIComponent(itemId)}/audits/${contentVersion}`),
+
+  dispatchAuditJob: (itemId: string, contentVersion: number) =>
+    request(`/content-items/${encodeURIComponent(itemId)}/audits/${contentVersion}/dispatch`, { method: "POST" }),
+
+  retryAuditJob: (itemId: string, contentVersion: number) =>
+    request(`/content-items/${encodeURIComponent(itemId)}/audits/${contentVersion}/retry`, { method: "POST" }),
+
   searchCharacters: (filters: { clientId?: string; query?: string; tags?: string[] }) => {
     const params = new URLSearchParams();
     if (filters.clientId) params.set("clientId", filters.clientId);

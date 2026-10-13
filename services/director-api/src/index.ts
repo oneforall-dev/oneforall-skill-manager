@@ -6,10 +6,13 @@ import { ensureProjectDirs, listProjects, loadProject, saveProject } from "./sto
 import { contentItemExists, listContentItems, loadContentItem, saveContentItem } from "./content-store.js";
 import { characterExists, loadCharacter, saveCharacter, searchCharacters } from "./character-store.js";
 import { characterVaultScannerStatus, downloadDriveImage, scanCharacterVault, startCharacterVaultScanner } from "./character-vault-scanner.js";
+import { ensureAuditJob, processAuditJob, startAuditWorker } from "./audit-coordinator.js";
+import { listAuditJobs, loadAuditJobForVersion, saveAuditJob } from "./audit-store.js";
 import type { Character, CharacterAssetRole, ContentItem, ContentStatus, Project } from "./types.js";
 
 const app = express();
 const port = Number(process.env.PORT || 2800);
+const serviceVersion = "1.1.0";
 app.use(express.json({ limit: "2mb" }));
 
 const createSchema = z.object({ name: z.string().trim().min(1).max(160), sourceUrl: z.string().url().optional() });
@@ -111,7 +114,7 @@ const summary = (project: Project) => ({
   latestVersion: project.latestVersion,
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "oneforall-director-api" }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "oneforall-director-api", version: serviceVersion, auditWorker: "enabled" }));
 app.get("/api/projects", async (_req, res, next) => {
   try { res.json({ projects: (await listProjects()).map(summary) }); } catch (error) { next(error); }
 });
@@ -209,8 +212,13 @@ app.get("/api/content-items/:itemId", async (req, res, next) => {
 app.patch("/api/content-items/:itemId", async (req, res, next) => {
   try {
     const item = await loadContentItem(req.params.itemId);
+    const previousStatus = item.status;
     Object.assign(item, updateContentSchema.parse(req.body));
     await saveContentItem(item);
+    if (item.status === "READY_FOR_AUDIT" && previousStatus !== "READY_FOR_AUDIT") {
+      const job = await ensureAuditJob(item);
+      void processAuditJob(job).catch((error) => console.error("Audit dispatch failed", error));
+    }
     res.json(item);
   } catch (error) { next(error); }
 });
@@ -224,6 +232,10 @@ app.post("/api/content-items/:itemId/versions", async (req, res, next) => {
     item.currentVersion = version;
     item.status = input.status as ContentStatus;
     await saveContentItem(item);
+    if (item.status === "READY_FOR_AUDIT") {
+      const job = await ensureAuditJob(item);
+      void processAuditJob(job).catch((error) => console.error("Audit dispatch failed", error));
+    }
     res.status(201).json({ itemId: item.itemId, contentVersion: version, status: item.status, version: item.versions.at(-1) });
   } catch (error) { next(error); }
 });
@@ -261,7 +273,51 @@ app.post("/api/content-items/:itemId/handoffs", async (req, res, next) => {
     item.handoffs.push(handoff);
     if (/auditor/i.test(input.targetPlugin) || /CHECK/i.test(input.targetNick)) item.status = "READY_FOR_AUDIT";
     await saveContentItem(item);
+    if (item.status === "READY_FOR_AUDIT") {
+      const job = await ensureAuditJob(item);
+      void processAuditJob(job).catch((error) => console.error("Audit dispatch failed", error));
+    }
     res.status(201).json({ itemId: item.itemId, status: item.status, handoff });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/content-items/:itemId/audits/:version", async (req, res, next) => {
+  try {
+    const version = Number(req.params.version);
+    if (!Number.isInteger(version) || version < 1) return res.status(400).json({ error: "version must be a positive integer" });
+    res.json(await loadAuditJobForVersion(req.params.itemId, version));
+  } catch (error) { next(error); }
+});
+
+app.post("/api/content-items/:itemId/audits/:version/dispatch", async (req, res, next) => {
+  try {
+    const version = Number(req.params.version);
+    const item = await loadContentItem(req.params.itemId);
+    if (item.currentVersion !== version) return res.status(409).json({ error: "Only the current content version can be dispatched" });
+    if (item.status !== "READY_FOR_AUDIT") return res.status(409).json({ error: `Item is not READY_FOR_AUDIT (current: ${item.status})` });
+    const job = await ensureAuditJob(item);
+    void processAuditJob(job).catch((error) => console.error("Audit dispatch failed", error));
+    res.status(job.status === "COMPLETED" ? 200 : 202).json(job);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/audit-jobs", async (_req, res, next) => {
+  try { res.json({ jobs: await listAuditJobs() }); } catch (error) { next(error); }
+});
+
+app.post("/api/content-items/:itemId/audits/:version/retry", async (req, res, next) => {
+  try {
+    const version = Number(req.params.version);
+    const item = await loadContentItem(req.params.itemId);
+    if (item.currentVersion !== version) return res.status(409).json({ error: "Only the current content version can be retried" });
+    const job = await loadAuditJobForVersion(item.itemId, version);
+    if (job.status === "COMPLETED") return res.status(409).json({ error: "Completed audits are immutable and cannot be repeated" });
+    job.status = "QUEUED";
+    job.nextAttemptAt = undefined;
+    job.lastError = undefined;
+    await saveAuditJob(job);
+    void processAuditJob(job).catch((error) => console.error("Audit retry dispatch failed", error));
+    res.status(202).json(job);
   } catch (error) { next(error); }
 });
 
@@ -385,4 +441,5 @@ app.use((error: any, _req: express.Request, res: express.Response, _next: expres
 app.listen(port, "0.0.0.0", () => {
   console.log(`Oneforall Director API listening on ${port}`);
   startCharacterVaultScanner();
+  startAuditWorker();
 });

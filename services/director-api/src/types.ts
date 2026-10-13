@@ -94,6 +94,50 @@ export type ContentHandoff = {
   createdAt: string;
 };
 
+export type AuditVerdict = "PASS" | "CORRECTIONS";
+
+export type AuditFinding = {
+  code: string;
+  severity: "INFO" | "WARNING" | "ERROR";
+  message: string;
+  assetPosition?: number;
+};
+
+export type AuditResult = {
+  auditId: string;
+  auditorIdentity: string;
+  directorContentVersion: number;
+  publisherContentVersion: number;
+  publisherContentHash: string;
+  verdict: AuditVerdict;
+  summary: string;
+  findings: AuditFinding[];
+  auditedAt: string;
+  publisherReceiptStatus: "NOT_REQUIRED" | "REGISTERED" | "BLOCKED_MISSING_AUTH" | "FAILED";
+  publisherReceiptError?: string;
+  socialManagerSyncStatus?: "SYNCED" | "FAILED";
+  socialManagerSyncError?: string;
+};
+
+export type AuditJobStatus = "QUEUED" | "RUNNING" | "RETRY_WAIT" | "COMPLETED" | "BLOCKED";
+
+export type AuditJob = {
+  id: string;
+  itemId: string;
+  clientId: string;
+  directorContentVersion: number;
+  status: AuditJobStatus;
+  attempt: number;
+  maxAttempts: number;
+  createdAt: string;
+  updatedAt: string;
+  nextAttemptAt?: string;
+  startedAt?: string;
+  completedAt?: string;
+  lastError?: string;
+  result?: AuditResult;
+};
+
 export type ContentItem = {
   itemId: string;
   clientId: string;
@@ -109,6 +153,7 @@ export type ContentItem = {
   versions: ContentVersion[];
   specialistCalls: SpecialistCall[];
   handoffs: ContentHandoff[];
+  auditResults?: AuditResult[];
 };
 
 export type CharacterAssetRole =
