@@ -1,0 +1,39 @@
+name: Build Social Publisher image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/social-publisher/**"
+      - ".github/workflows/social-publisher-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - working-directory: services/social-publisher
+        run: npm ci
+      - working-directory: services/social-publisher
+        run: npm test
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: services/social-publisher
+          push: true
+          tags: |
+            ghcr.io/oneforall-dev/oneforall-social-publisher:owner-override-0.8.0
+            ghcr.io/oneforall-dev/oneforall-social-publisher:latest

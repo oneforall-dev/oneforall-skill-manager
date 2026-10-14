@@ -1,0 +1,36 @@
+{
+  "name": "oneforall-social-publisher-v21",
+  "version": "0.8.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "dist",
+    "migrations",
+    "skills",
+    "README.md"
+  ],
+  "scripts": {
+    "dev": "tsx src/server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc -p tsconfig.json",
+    "test:unit": "node --test tests/unit/*.test.mjs",
+    "test:integration": "node --test tests/integration/*.test.mjs",
+    "test": "npm run build && npm run test:unit && npm run test:integration",
+    "migrate": "node dist/migrate.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1141.0",
+    "@aws-sdk/s3-request-presigner": "3.1141.0",
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.1.0",
+    "pg": "^8.16.3",
+    "sharp": "0.35.5",
+    "zod": "^4.1.11"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "@types/pg": "^8.15.5",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.2"
+  }
+}
