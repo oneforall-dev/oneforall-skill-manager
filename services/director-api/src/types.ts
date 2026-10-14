@@ -138,6 +138,14 @@ export type AuditJob = {
   result?: AuditResult;
 };
 
+export type AuditExecutionState = {
+  directorContentVersion: number;
+  status: "AUDITOR_NOT_EXECUTED";
+  reason: "AUTOMATIC_AUDITOR_DISABLED";
+  recordedAt: string;
+  executionMode: "EXTERNAL_OR_ACTIVE_ORCHESTRATION";
+};
+
 export type ContentItem = {
   itemId: string;
   clientId: string;
@@ -154,6 +162,7 @@ export type ContentItem = {
   specialistCalls: SpecialistCall[];
   handoffs: ContentHandoff[];
   auditResults?: AuditResult[];
+  auditExecutionStates?: AuditExecutionState[];
 };
 
 export type CharacterAssetRole =

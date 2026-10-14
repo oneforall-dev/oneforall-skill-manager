@@ -106,6 +106,9 @@ export const director = {
   getAuditJob: (itemId: string, contentVersion: number) =>
     request(`/content-items/${encodeURIComponent(itemId)}/audits/${contentVersion}`),
 
+  getAuditExecutionState: (itemId: string, contentVersion: number) =>
+    request(`/content-items/${encodeURIComponent(itemId)}/audits/${contentVersion}/state`),
+
   dispatchAuditJob: (itemId: string, contentVersion: number) =>
     request(`/content-items/${encodeURIComponent(itemId)}/audits/${contentVersion}/dispatch`, { method: "POST" }),
 

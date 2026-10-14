@@ -36,5 +36,5 @@ jobs:
           context: services/${{ matrix.service }}
           push: true
           tags: |
-            ghcr.io/oneforall-dev/${{ matrix.image }}:audit-automation-1.1.0
+            ghcr.io/oneforall-dev/${{ matrix.image }}:owner-override-flow-1.2.0
             ghcr.io/oneforall-dev/${{ matrix.image }}:latest

@@ -71,11 +71,11 @@ function buildServer() {
   const server = new McpServer(
     {
       name: "oneforall-director",
-      version: "1.1.0",
+      version: "1.2.0",
     },
     {
       instructions:
-        "Tools for Oneforall Director creative ownership and video production. Manage persistent content items, versions, specialist calls, results and Auditor handoffs, plus create, inspect, analyze, plan, render and revise video projects. Preserve ITEM_ID and never claim another agent executed work without a recorded result. For every recurring character stored in the Character Vault, first call search_characters and get_character, then call load_character_references. That tool returns approved FACE_LOCK, HERO_REFERENCE and CHAR_SHEET files as actual image content. Only after those images are present, use ChatGPT's built-in image generator with them as reference inputs. Identity comes exclusively from FACE_LOCK, which is dominant. Never redescribe, reinterpret or regenerate facial traits. HERO_REFERENCE and CHAR_SHEET may guide body, wardrobe and canon but must not average or replace the face. Prompt controls only environment, wardrobe, pose, expression, lighting and camera. Never generate from character metadata or a text-only prompt. If load_character_references cannot load an approved FACE_LOCK, stop and report the error instead of generating a substitute person.",
+        "Tools for Oneforall Director creative ownership and video production. Manage persistent content items, versions, specialist calls, results and Auditor handoffs, plus create, inspect, analyze, plan, render and revise video projects. Preserve ITEM_ID and never claim another agent executed work without a recorded result. Automatic key-based Auditor execution is disabled: READY_FOR_AUDIT records AUDITOR_NOT_EXECUTED until a real external/active-orchestration audit is recorded; Publisher OWNER_OVERRIDE is a separate valid authorization route. For every recurring character stored in the Character Vault, first call search_characters and get_character, then call load_character_references. That tool returns approved FACE_LOCK, HERO_REFERENCE and CHAR_SHEET files as actual image content. Only after those images are present, use ChatGPT's built-in image generator with them as reference inputs. Identity comes exclusively from FACE_LOCK, which is dominant. Never redescribe, reinterpret or regenerate facial traits. HERO_REFERENCE and CHAR_SHEET may guide body, wardrobe and canon but must not average or replace the face. Prompt controls only environment, wardrobe, pose, expression, lighting and camera. Never generate from character metadata or a text-only prompt. If load_character_references cannot load an approved FACE_LOCK, stop and report the error instead of generating a substitute person.",
     }
   );
 
@@ -424,8 +424,8 @@ function buildServer() {
   server.registerTool(
     "get_audit_job",
     {
-      title: "Get automatic Auditor job",
-      description: "Read the durable real Auditor execution state for one exact Director ITEM_ID and CONTENT_VERSION, including PASS/CORRECTIONS evidence and Publisher receipt registration state.",
+      title: "Get historical Auditor job",
+      description: "Read a historical Auditor worker job created before automatic key-based execution was disabled. This is read-only evidence and never starts or retries Auditor.",
       inputSchema: z.object({ item_id: z.string().min(1), content_version: z.number().int().positive() }),
       outputSchema: wrappedOutputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
@@ -436,10 +436,24 @@ function buildServer() {
   );
 
   server.registerTool(
+    "get_audit_execution_state",
+    {
+      title: "Get Auditor execution state",
+      description: "Read whether an exact Director ITEM_ID and CONTENT_VERSION has a recorded PASS/CORRECTIONS result or remains AUDITOR_NOT_EXECUTED. Auditor now runs only through active/external orchestration; Publisher OWNER_OVERRIDE is an independent publication authorization.",
+      inputSchema: z.object({ item_id: z.string().min(1), content_version: z.number().int().positive() }),
+      outputSchema: wrappedOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ item_id, content_version }) => {
+      try { return textResult(await director.getAuditExecutionState(item_id, content_version)); } catch (e) { return errorResult(e); }
+    }
+  );
+
+  server.registerTool(
     "dispatch_audit_job",
     {
-      title: "Dispatch automatic Auditor job",
-      description: "Idempotently dispatch the real Auditor worker for an exact existing READY_FOR_AUDIT version. Intended for pre-deployment pending items; new READY_FOR_AUDIT transitions dispatch automatically.",
+      title: "Automatic Auditor disabled",
+      description: "Compatibility endpoint. Automatic server-side Auditor execution is disabled and this always returns AUTOMATIC_AUDITOR_DISABLED without using OPENAI_API_KEY.",
       inputSchema: z.object({ item_id: z.string().min(1), content_version: z.number().int().positive() }),
       outputSchema: wrappedOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
@@ -452,8 +466,8 @@ function buildServer() {
   server.registerTool(
     "retry_audit_job",
     {
-      title: "Retry blocked automatic Auditor job",
-      description: "Requeue a blocked or exhausted Auditor job for the unchanged current version after its real technical dependency has been repaired. Completed identical versions cannot be repeated.",
+      title: "Automatic Auditor retry disabled",
+      description: "Compatibility endpoint. Historical jobs remain readable, but automatic retry is disabled and never uses OPENAI_API_KEY.",
       inputSchema: z.object({ item_id: z.string().min(1), content_version: z.number().int().positive() }),
       outputSchema: wrappedOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
@@ -605,8 +619,8 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "oneforall-director-mcp",
-    version: "1.1.0",
-    features: ["automatic-auditor-jobs", "audit-deduplication", "bounded-audit-retries", "publisher-version-reconciliation"],
+    version: "1.2.0",
+    features: ["explicit-auditor-execution-state", "historical-audit-job-readback", "owner-override-publication-route", "publisher-version-reconciliation"],
   });
 });
 
