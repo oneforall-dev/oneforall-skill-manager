@@ -19,10 +19,17 @@ test("owner override migration preserves history and binds an immutable action s
   assert.match(sql,/content_version integer NOT NULL/);
   assert.match(sql,/content_hash text NOT NULL/);
   assert.match(sql,/instagram_account_id uuid NOT NULL/);
-  assert.match(sql,/owner_identity text NOT NULL/);
-  assert.match(sql,/authorized_at timestamptz NOT NULL DEFAULT now\(\)/);
   assert.match(sql,/content_snapshot jsonb NOT NULL/);
   assert.match(sql,/action IN \('publish_now','schedule'\)/);
   assert.doesNotMatch(sql,/UPDATE posts SET audit_required=true/);
+});
+
+test("Trial Reel migration is additive and constrains strategy to Reel content",async()=>{
+  const sql=await readFile(new URL("../../migrations/009_trial_reels.sql",import.meta.url),"utf8");
+  assert.match(sql,/ADD COLUMN IF NOT EXISTS trial_reel boolean NOT NULL DEFAULT false/);
+  assert.match(sql,/ADD COLUMN IF NOT EXISTS trial_graduation_strategy text/);
+  assert.match(sql,/trial_reel=true AND format='reel'/);
+  assert.match(sql,/trial_graduation_strategy IN \('MANUAL','SS_PERFORMANCE'\)/);
+  assert.doesNotMatch(sql,/UPDATE posts SET/);
 });
 

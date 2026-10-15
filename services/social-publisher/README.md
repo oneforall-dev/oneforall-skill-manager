@@ -1,6 +1,14 @@
-# Oneforall Social Publisher 0.8.0
+# Oneforall Social Publisher 0.9.0
 
 Multi-client Instagram publishing MCP for ChatGPT/Work with Meta OAuth, Cloudflare R2 storage, scheduling, account routing and audit logs.
+
+## Trial Reels in 0.9.0
+- `save_content_item`, `create_post_draft` and `schedule_post` accept `trial_reel=true` only when `format=reel`.
+- Trial Reels require `trial_graduation_strategy=MANUAL` or `SS_PERFORMANCE` and send it to Meta as `trial_params` on container creation.
+- Trial mode and its strategy are persisted and included in the content hash, Auditor receipt and OWNER_OVERRIDE scope. Changing either invalidates prior approval.
+- Existing non-trial hashes remain byte-for-byte compatible, preserving historical approvals and scheduled content.
+- If Meta rejects Trial Reel parameters, Publisher records the real failure and does not retry as a normal Reel.
+- `INSTAGRAM_TRIAL_REELS_ENABLED=false` is an emergency kill switch. Trial Reels are enabled unless this value is exactly `false`.
 
 ## Audit, owner authorization and resilience in 0.8.0
 - New or materially changed content requires either an authenticated Oneforall Auditor PASS receipt or an exact, explicit `OWNER_OVERRIDE` before approval, scheduling, worker execution or immediate publication.

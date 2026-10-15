@@ -1,6 +1,7 @@
 import { pool, withTx } from "./db.js";
 import { decryptSecret, encryptSecret } from "./crypto.js";
 import type { IgCredentials } from "./instagram.js";
+import type { TrialReelGraduationStrategy } from "./instagram.js";
 import { createHash } from "node:crypto";
 import { loadAuditVerifierConfig, verifyAuditReceipt, type AuditReceiptPayload } from "./audit.js";
 import { publicationIdempotencyKey } from "./publication-safety.js";
@@ -15,10 +16,14 @@ type ContentSnapshot = {
   assetIds:string[];
   shareToFeed:boolean;
   coverUrl:string|null;
+  trialReel:boolean;
+  trialGraduationStrategy:TrialReelGraduationStrategy|null;
 };
 
+type ContentInput={clientSlug:string;accountId:string;format:ContentFormat;caption?:string;assetIds:string[];shareToFeed?:boolean;coverUrl?:string;trialReel?:boolean;trialGraduationStrategy?:TrialReelGraduationStrategy};
+
 export function contentHash(snapshot:ContentSnapshot) {
-  return createHash("sha256").update(JSON.stringify({
+  const canonical:any={
     client_id:snapshot.clientId,
     instagram_account_id:snapshot.accountId,
     format:snapshot.format,
@@ -26,10 +31,17 @@ export function contentHash(snapshot:ContentSnapshot) {
     asset_ids:snapshot.assetIds,
     share_to_feed:snapshot.shareToFeed,
     cover_url:snapshot.coverUrl
-  })).digest("hex");
+  };
+  // Preserve every pre-Trial-Reels content hash exactly. Trial settings are
+  // appended only when enabled, so historical approvals remain valid.
+  if(snapshot.trialReel){
+    canonical.trial_reel=true;
+    canonical.trial_graduation_strategy=snapshot.trialGraduationStrategy;
+  }
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
-async function validateContent(c:any,args:{clientSlug:string;accountId:string;format:ContentFormat;caption?:string;assetIds:string[];shareToFeed?:boolean;coverUrl?:string}) {
+async function validateContent(c:any,args:ContentInput) {
   const cr=await c.query(`SELECT id FROM clients WHERE slug=$1 AND status='active'`,[args.clientSlug]);
   if(!cr.rowCount) throw new Error(`Unknown active client: ${args.clientSlug}`);
   const clientId=cr.rows[0].id as string;
@@ -39,6 +51,9 @@ async function validateContent(c:any,args:{clientSlug:string;accountId:string;fo
   if(args.format==='image' && args.assetIds.length!==1) throw new Error("Image post requires exactly 1 asset");
   if(args.format==='carousel' && (args.assetIds.length<2||args.assetIds.length>10)) throw new Error("Carousel requires 2-10 assets");
   if(args.format==='reel' && args.assetIds.length!==1) throw new Error("Reel requires exactly 1 video asset");
+  if(args.trialReel&&args.format!=='reel') throw new Error("Trial mode is only valid for Reels");
+  if(args.trialReel&&!args.trialGraduationStrategy) throw new Error("Trial Reel requires trial_graduation_strategy");
+  if(!args.trialReel&&args.trialGraduationStrategy) throw new Error("trial_graduation_strategy requires trial_reel=true");
   const assets=await c.query(`SELECT id,kind FROM assets WHERE client_id=$1 AND id=ANY($2::uuid[])`,[clientId,args.assetIds]);
   if(assets.rowCount!==args.assetIds.length) throw new Error("One or more assets do not belong to this client");
   if(args.format==='reel' && assets.rows[0].kind!=='video') throw new Error("Reel asset must be video");
@@ -46,7 +61,7 @@ async function validateContent(c:any,args:{clientSlug:string;accountId:string;fo
   return {
     clientId,
     accountId:accountId!,
-    snapshot:{clientId,accountId:accountId!,format:args.format,caption:args.caption||null,assetIds:args.assetIds,shareToFeed:args.shareToFeed??true,coverUrl:args.coverUrl||null} as ContentSnapshot
+    snapshot:{clientId,accountId:accountId!,format:args.format,caption:args.caption||null,assetIds:args.assetIds,shareToFeed:args.shareToFeed??true,coverUrl:args.coverUrl||null,trialReel:args.trialReel??false,trialGraduationStrategy:args.trialReel?(args.trialGraduationStrategy||null):null} as ContentSnapshot
   };
 }
 
@@ -106,11 +121,11 @@ export async function registerAsset(clientSlug:string, kind:"image"|"video", pub
 export async function listAssets(clientSlug:string, limit=50) {
   return (await pool.query(`SELECT a.id,a.kind,a.public_url,a.mime_type,a.label,a.storage_provider,a.storage_key,a.size_bytes,a.created_at FROM assets a JOIN clients c ON c.id=a.client_id WHERE c.slug=$1 ORDER BY a.created_at DESC LIMIT $2`,[clientSlug,limit])).rows;
 }
-export async function createPost(args:{clientSlug:string;accountId:string;itemId?:string;format:ContentFormat;caption?:string;assetIds:string[];shareToFeed?:boolean;coverUrl?:string;scheduledAt?:string;status?:"draft"|"scheduled";approved?:boolean;approvedBy?:string}) {
+export async function createPost(args:ContentInput&{itemId?:string;scheduledAt?:string;status?:"draft"|"scheduled";approved?:boolean;approvedBy?:string}) {
   return withTx(async c=>{
     const {clientId,accountId}=await validateContent(c,args);
     if(args.status==='scheduled'||args.scheduledAt||args.approved) throw new Error("New content must use save_content_item -> authenticated Auditor receipt -> approve_content_item -> schedule_content_item");
-    const pr=await c.query(`INSERT INTO posts(client_id,instagram_account_id,item_id,format,caption,share_to_feed,cover_url,status,scheduled_at,approved_version,approved_content_hash,approved_at,approved_by,audit_required_at) VALUES($1,$2,$3,$4,$5,$6,$7,'draft',NULL,NULL,NULL,NULL,NULL,now()) RETURNING *`,[clientId,accountId,args.itemId||null,args.format,args.caption||null,args.shareToFeed??true,args.coverUrl||null]);
+    const pr=await c.query(`INSERT INTO posts(client_id,instagram_account_id,item_id,format,caption,share_to_feed,cover_url,trial_reel,trial_graduation_strategy,status,scheduled_at,approved_version,approved_content_hash,approved_at,approved_by,audit_required_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'draft',NULL,NULL,NULL,NULL,NULL,now()) RETURNING *`,[clientId,accountId,args.itemId||null,args.format,args.caption||null,args.shareToFeed??true,args.coverUrl||null,args.trialReel??false,args.trialReel?args.trialGraduationStrategy||null:null]);
     for(let i=0;i<args.assetIds.length;i++) await c.query(`INSERT INTO post_assets(post_id,asset_id,position) VALUES($1,$2,$3)`,[pr.rows[0].id,args.assetIds[i],i]);
     return pr.rows[0];
   });
@@ -120,7 +135,7 @@ export async function getPost(postId:string) {
   if(!rows[0]) throw new Error("Post not found");
   const assets=(await pool.query(`SELECT x.position,a.id,a.kind,a.public_url,a.mime_type,a.storage_provider,a.storage_key,a.size_bytes,a.label FROM post_assets x JOIN assets a ON a.id=x.asset_id WHERE x.post_id=$1 ORDER BY x.position`,[postId])).rows;
   const post=rows[0];
-  const currentHash=contentHash({clientId:post.client_id,accountId:post.instagram_account_id,format:post.format,caption:post.caption,assetIds:assets.map((a:any)=>a.id),shareToFeed:post.share_to_feed,coverUrl:post.cover_url});
+  const currentHash=contentHash({clientId:post.client_id,accountId:post.instagram_account_id,format:post.format,caption:post.caption,assetIds:assets.map((a:any)=>a.id),shareToFeed:post.share_to_feed,coverUrl:post.cover_url,trialReel:post.trial_reel,trialGraduationStrategy:post.trial_graduation_strategy});
   const receipt=(await pool.query(`SELECT audit_id,issuer,auditor_identity,verdict,content_version,content_hash,audited_at,received_at FROM audit_receipts WHERE post_id=$1 AND content_version=$2 AND content_hash=$3 AND verdict='PASS' ORDER BY audited_at DESC LIMIT 1`,[postId,post.content_version,currentHash])).rows[0]||null;
   const ownerOverride=(await pool.query(`SELECT id,authorization_key,post_id,client_id,item_id,content_version,content_hash,instagram_account_id,owner_identity,action,scheduled_at,scheduled_timezone,content_snapshot,authorized_at FROM owner_overrides WHERE post_id=$1 AND content_version=$2 AND content_hash=$3 AND instagram_account_id=$4 ORDER BY authorized_at DESC LIMIT 1`,[postId,post.content_version,currentHash,post.instagram_account_id])).rows[0]||null;
   const auditState=receipt?'PASS':auditExecutionState(post.audit_required_at);
@@ -132,22 +147,22 @@ export async function getContentItem(itemId:string,clientSlug?:string) {
   return getPost(resolved.id);
 }
 
-export async function saveContentItem(args:{clientSlug:string;itemId:string;accountId:string;format:ContentFormat;caption?:string;assetIds:string[];shareToFeed?:boolean;coverUrl?:string}) {
+export async function saveContentItem(args:ContentInput&{itemId:string}) {
   const result=await withTx(async c=>{
     const validated=await validateContent(c,args);
     const targetHash=contentHash(validated.snapshot);
     const existing=await c.query(`SELECT * FROM posts WHERE client_id=$1 AND item_id=$2 FOR UPDATE`,[validated.clientId,args.itemId]);
     if(!existing.rowCount){
-      const inserted=await c.query(`INSERT INTO posts(client_id,instagram_account_id,item_id,format,caption,share_to_feed,cover_url,status,approval_required,audit_required,audit_required_at) VALUES($1,$2,$3,$4,$5,$6,$7,'draft',true,true,now()) RETURNING id`,[validated.clientId,validated.accountId,args.itemId,args.format,args.caption||null,args.shareToFeed??true,args.coverUrl||null]);
+      const inserted=await c.query(`INSERT INTO posts(client_id,instagram_account_id,item_id,format,caption,share_to_feed,cover_url,trial_reel,trial_graduation_strategy,status,approval_required,audit_required,audit_required_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'draft',true,true,now()) RETURNING id`,[validated.clientId,validated.accountId,args.itemId,args.format,args.caption||null,args.shareToFeed??true,args.coverUrl||null,args.trialReel??false,args.trialReel?args.trialGraduationStrategy||null:null]);
       for(let i=0;i<args.assetIds.length;i++) await c.query(`INSERT INTO post_assets(post_id,asset_id,position) VALUES($1,$2,$3)`,[inserted.rows[0].id,args.assetIds[i],i]);
       return {id:inserted.rows[0].id,created:true,changed:true};
     }
     const current=existing.rows[0];
     if(['scheduled','publishing','published'].includes(current.status)) throw new Error(`Content ${args.itemId} cannot be edited while status is ${current.status}`);
     const currentAssets=(await c.query(`SELECT asset_id FROM post_assets WHERE post_id=$1 ORDER BY position`,[current.id])).rows.map((r:any)=>r.asset_id);
-    const currentHash=contentHash({clientId:current.client_id,accountId:current.instagram_account_id,format:current.format,caption:current.caption,assetIds:currentAssets,shareToFeed:current.share_to_feed,coverUrl:current.cover_url});
+    const currentHash=contentHash({clientId:current.client_id,accountId:current.instagram_account_id,format:current.format,caption:current.caption,assetIds:currentAssets,shareToFeed:current.share_to_feed,coverUrl:current.cover_url,trialReel:current.trial_reel,trialGraduationStrategy:current.trial_graduation_strategy});
     if(currentHash===targetHash) return {id:current.id,created:false,changed:false};
-    await c.query(`UPDATE posts SET instagram_account_id=$2,format=$3,caption=$4,share_to_feed=$5,cover_url=$6,status='draft',scheduled_at=NULL,last_error=NULL,content_version=content_version+1,approved_version=NULL,approved_content_hash=NULL,approved_at=NULL,approved_by=NULL,approval_required=true,audit_required=true,audit_required_at=now(),updated_at=now() WHERE id=$1`,[current.id,validated.accountId,args.format,args.caption||null,args.shareToFeed??true,args.coverUrl||null]);
+    await c.query(`UPDATE posts SET instagram_account_id=$2,format=$3,caption=$4,share_to_feed=$5,cover_url=$6,trial_reel=$7,trial_graduation_strategy=$8,status='draft',scheduled_at=NULL,last_error=NULL,content_version=content_version+1,approved_version=NULL,approved_content_hash=NULL,approved_at=NULL,approved_by=NULL,approval_required=true,audit_required=true,audit_required_at=now(),updated_at=now() WHERE id=$1`,[current.id,validated.accountId,args.format,args.caption||null,args.shareToFeed??true,args.coverUrl||null,args.trialReel??false,args.trialReel?args.trialGraduationStrategy||null:null]);
     await c.query(`DELETE FROM post_assets WHERE post_id=$1`,[current.id]);
     for(let i=0;i<args.assetIds.length;i++) await c.query(`INSERT INTO post_assets(post_id,asset_id,position) VALUES($1,$2,$3)`,[current.id,args.assetIds[i],i]);
     return {id:current.id,created:false,changed:true};
@@ -214,11 +229,11 @@ export async function registerOwnerOverride(args:{itemId:string;clientSlug?:stri
     if(args.action==='publish_now'&&args.scheduledAt) throw new Error("OWNER_OVERRIDE_INVALID: publish_now cannot include scheduled_at");
     const assets=(await c.query(`SELECT x.position,a.id,a.kind,a.public_url,a.label FROM post_assets x JOIN assets a ON a.id=x.asset_id WHERE x.post_id=$1 ORDER BY x.position`,[post.id])).rows;
     const assetIds=assets.map((asset:any)=>asset.id);
-    const hash=contentHash({clientId:post.client_id,accountId:post.instagram_account_id,format:post.format,caption:post.caption,assetIds,shareToFeed:post.share_to_feed,coverUrl:post.cover_url});
+    const hash=contentHash({clientId:post.client_id,accountId:post.instagram_account_id,format:post.format,caption:post.caption,assetIds,shareToFeed:post.share_to_feed,coverUrl:post.cover_url,trialReel:post.trial_reel,trialGraduationStrategy:post.trial_graduation_strategy});
     if(hash!==args.expectedContentHash) throw new Error("OWNER_OVERRIDE_SCOPE_MISMATCH: content hash");
     const scope={postId:post.id,clientId:post.client_id,itemId:post.item_id,contentVersion:post.content_version,contentHash:hash,accountId:post.instagram_account_id,action:args.action,scheduledAt:args.scheduledAt,scheduledTimezone:args.scheduledTimezone};
     const key=ownerOverrideKey(scope);
-    const snapshot={client_id:post.client_id,item_id:post.item_id,content_version:post.content_version,content_hash:hash,instagram_account_id:post.instagram_account_id,format:post.format,caption:post.caption,ordered_asset_ids:assetIds,assets,share_to_feed:post.share_to_feed,cover_url:post.cover_url,action:args.action,scheduled_at:args.scheduledAt||null,scheduled_timezone:args.scheduledTimezone||null};
+    const snapshot={client_id:post.client_id,item_id:post.item_id,content_version:post.content_version,content_hash:hash,instagram_account_id:post.instagram_account_id,format:post.format,caption:post.caption,ordered_asset_ids:assetIds,assets,share_to_feed:post.share_to_feed,cover_url:post.cover_url,trial_reel:post.trial_reel,trial_graduation_strategy:post.trial_graduation_strategy,action:args.action,scheduled_at:args.scheduledAt||null,scheduled_timezone:args.scheduledTimezone||null};
     const inserted=await c.query(`INSERT INTO owner_overrides(authorization_key,post_id,client_id,item_id,content_version,content_hash,instagram_account_id,owner_identity,action,scheduled_at,scheduled_timezone,content_snapshot) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(authorization_key) DO NOTHING RETURNING *`,[key,post.id,post.client_id,post.item_id,post.content_version,hash,post.instagram_account_id,args.ownerIdentity,args.action,args.scheduledAt||null,args.scheduledTimezone||null,snapshot]);
     const override=inserted.rows[0]||(await c.query(`SELECT * FROM owner_overrides WHERE authorization_key=$1`,[key])).rows[0];
     if(!ownerOverrideMatches(override,scope)) throw new Error("OWNER_OVERRIDE_REPLAY_MISMATCH");
@@ -235,7 +250,7 @@ export async function registerAuditReceipt(args:{payload:AuditReceiptPayload;sig
     const post=q.rows[0];
     if(!post) throw new Error("Content item not found");
     const assetIds=(await c.query(`SELECT asset_id FROM post_assets WHERE post_id=$1 ORDER BY position`,[post.id])).rows.map((r:any)=>r.asset_id);
-    const hash=contentHash({clientId:post.client_id,accountId:post.instagram_account_id,format:post.format,caption:post.caption,assetIds,shareToFeed:post.share_to_feed,coverUrl:post.cover_url});
+    const hash=contentHash({clientId:post.client_id,accountId:post.instagram_account_id,format:post.format,caption:post.caption,assetIds,shareToFeed:post.share_to_feed,coverUrl:post.cover_url,trialReel:post.trial_reel,trialGraduationStrategy:post.trial_graduation_strategy});
     if(args.payload.client_id!==post.client_id) throw new Error("AUDIT_RECEIPT_SCOPE_MISMATCH: client_id");
     if(args.payload.content_version!==post.content_version) throw new Error("AUDIT_RECEIPT_SCOPE_MISMATCH: content_version");
     if(args.payload.content_hash!==hash) throw new Error("AUDIT_RECEIPT_SCOPE_MISMATCH: content_hash");
@@ -256,7 +271,7 @@ export async function approveContentItem(args:{itemId:string;clientSlug?:string;
     if(post.content_version!==args.expectedVersion) throw new Error(`Version mismatch: expected ${args.expectedVersion}, current ${post.content_version}`);
     if(['scheduled','publishing','published'].includes(post.status)) throw new Error(`Content cannot be approved while status is ${post.status}`);
     const assetIds=(await c.query(`SELECT asset_id FROM post_assets WHERE post_id=$1 ORDER BY position`,[post.id])).rows.map((r:any)=>r.asset_id);
-    const hash=contentHash({clientId:post.client_id,accountId:post.instagram_account_id,format:post.format,caption:post.caption,assetIds,shareToFeed:post.share_to_feed,coverUrl:post.cover_url});
+    const hash=contentHash({clientId:post.client_id,accountId:post.instagram_account_id,format:post.format,caption:post.caption,assetIds,shareToFeed:post.share_to_feed,coverUrl:post.cover_url,trialReel:post.trial_reel,trialGraduationStrategy:post.trial_graduation_strategy});
     await requirePublicationAuthorizationWithClient(c,post,hash);
     await c.query(`UPDATE posts SET status='draft',approved_version=content_version,approved_content_hash=$2,approved_at=now(),approved_by=$3,approval_required=true,last_error=NULL,updated_at=now() WHERE id=$1`,[post.id,hash,args.approvedBy||null]);
   });
@@ -272,7 +287,7 @@ export async function listContentItems(args:{clientSlug?:string;readiness?:"all"
   if(readiness==='unapproved') where.push(`(p.approved_at IS NULL OR p.approved_version IS DISTINCT FROM p.content_version) AND p.status<>'published'`);
   if(readiness==='published') where.push(`p.status='published'`);
   params.push(args.limit||50);
-  return (await pool.query(`SELECT p.id AS post_id,p.item_id,p.content_version,p.approved_version,p.approved_at,p.approved_by,p.status,p.format,p.caption,p.instagram_media_id,p.published_at,c.slug AS client_slug,a.username AS instagram_username,(SELECT count(*)::int FROM post_assets pa WHERE pa.post_id=p.id) AS asset_count FROM posts p JOIN clients c ON c.id=p.client_id JOIN instagram_accounts a ON a.id=p.instagram_account_id WHERE ${where.join(' AND ')} ORDER BY p.updated_at DESC LIMIT $${params.length}`,params)).rows;
+  return (await pool.query(`SELECT p.id AS post_id,p.item_id,p.content_version,p.approved_version,p.approved_at,p.approved_by,p.status,p.format,p.trial_reel,p.trial_graduation_strategy,p.caption,p.instagram_media_id,p.published_at,c.slug AS client_slug,a.username AS instagram_username,(SELECT count(*)::int FROM post_assets pa WHERE pa.post_id=p.id) AS asset_count FROM posts p JOIN clients c ON c.id=p.client_id JOIN instagram_accounts a ON a.id=p.instagram_account_id WHERE ${where.join(' AND ')} ORDER BY p.updated_at DESC LIMIT $${params.length}`,params)).rows;
 }
 
 export async function getContentItemPostId(itemId:string,clientSlug?:string) {
@@ -280,11 +295,11 @@ export async function getContentItemPostId(itemId:string,clientSlug?:string) {
 }
 
 export function hashPostContent(post:any) {
-  return contentHash({clientId:post.client_id,accountId:post.instagram_account_id,format:post.format,caption:post.caption||null,assetIds:post.assets.map((a:any)=>a.id),shareToFeed:post.share_to_feed,coverUrl:post.cover_url||null});
+  return contentHash({clientId:post.client_id,accountId:post.instagram_account_id,format:post.format,caption:post.caption||null,assetIds:post.assets.map((a:any)=>a.id),shareToFeed:post.share_to_feed,coverUrl:post.cover_url||null,trialReel:post.trial_reel,trialGraduationStrategy:post.trial_graduation_strategy||null});
 }
 export async function listScheduled(clientSlug?:string, limit=50) {
   const p:any[]=[]; let where=`p.status='scheduled'`; if(clientSlug){p.push(clientSlug);where+=` AND c.slug=$1`;}; p.push(limit); const idx=p.length;
-  return (await pool.query(`SELECT p.id,p.item_id,p.content_version,c.slug AS client_slug,a.username,p.format,p.caption,p.scheduled_at,p.scheduled_timezone,p.created_at FROM posts p JOIN clients c ON c.id=p.client_id JOIN instagram_accounts a ON a.id=p.instagram_account_id WHERE ${where} ORDER BY p.scheduled_at ASC LIMIT $${idx}`,p)).rows;
+  return (await pool.query(`SELECT p.id,p.item_id,p.content_version,c.slug AS client_slug,a.username,p.format,p.trial_reel,p.trial_graduation_strategy,p.caption,p.scheduled_at,p.scheduled_timezone,p.created_at FROM posts p JOIN clients c ON c.id=p.client_id JOIN instagram_accounts a ON a.id=p.instagram_account_id WHERE ${where} ORDER BY p.scheduled_at ASC LIMIT $${idx}`,p)).rows;
 }
 
 export async function scheduleExistingPost(postId:string, scheduledAt:string, scheduledTimezone?:string) {

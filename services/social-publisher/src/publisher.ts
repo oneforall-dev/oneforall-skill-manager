@@ -42,7 +42,7 @@ export async function publishPost(postId:string) {
   const claim=await claimPublishOperation(post);
   if(claim.state==='published') return publishedResult(await getPost(postId),true);
   const operationId=claim.operation.id as string;
-  await logPublish(postId,account.id,'publishing',{format:post.format,username:account.username,operation_id:operationId,idempotency_key:claim.idempotency_key,attempt:claim.operation.attempt});
+  await logPublish(postId,account.id,'publishing',{format:post.format,trial_reel:post.trial_reel,trial_graduation_strategy:post.trial_graduation_strategy,username:account.username,operation_id:operationId,idempotency_key:claim.idempotency_key,attempt:claim.operation.attempt});
   let mediaId:string|undefined;
   try {
     let result:{id:string};
@@ -50,7 +50,7 @@ export async function publishPost(postId:string) {
     const hooks={beforePublish:()=>markPublishPending(operationId).then(()=>undefined)};
     if(post.format==='image') result=await publishImage(account.credentials,assets[0].public_url,post.caption||undefined,hooks);
     else if(post.format==='carousel') result=await publishCarousel(account.credentials,assets.map((a:any)=>a.public_url),post.caption||undefined,hooks);
-    else result=await publishReel(account.credentials,post.assets[0].public_url,post.caption||undefined,post.share_to_feed,post.cover_url||undefined,hooks);
+    else result=await publishReel(account.credentials,post.assets[0].public_url,post.caption||undefined,post.share_to_feed,post.cover_url||undefined,post.trial_reel?post.trial_graduation_strategy:undefined,hooks);
     mediaId=result.id;
     const committed=await markPublishSucceeded({operationId,postId,mediaId});
     await logPublish(postId,account.id,'published',{media_id:mediaId,operation_id:operationId,idempotency_key:claim.idempotency_key}).catch(error=>console.error('published audit log write failed',postId,error));

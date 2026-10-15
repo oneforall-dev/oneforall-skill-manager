@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
-import { publishImage } from "../../dist/instagram.js";
+import { publishImage, publishReel } from "../../dist/instagram.js";
 
 async function listen(handler){const server=createServer(handler);server.listen(0,"127.0.0.1");await once(server,"listening");const address=server.address();return {server,url:`http://127.0.0.1:${address.port}`};}
 
@@ -36,5 +36,26 @@ test("ambiguous media_publish failures are marked unknown",async t=>{
   t.after(()=>mock.server.close());
   process.env.META_GRAPH_BASE=mock.url;process.env.META_GRAPH_VERSION="v24.0";
   await assert.rejects(()=>publishImage({instagramUserId:"ig-user",accessToken:"token"},"https://example.invalid/image.jpg",undefined,{beforePublish:()=>undefined}),error=>error.publicationOutcome==="unknown");
+});
+
+test("Trial Reel sends trial_params and publishes only after the container finishes",async t=>{
+  let publishCalls=0;let trialParams=null;let pending=false;
+  const mock=await listen((req,res)=>{const url=new URL(req.url,"http://localhost");res.setHeader("content-type","application/json");if(url.pathname.endsWith("/media_publish")){publishCalls++;assert.equal(pending,true);res.end(JSON.stringify({id:"trial-media-123"}));return;}if(req.method==="GET"){res.end(JSON.stringify({id:"trial-container-1",status_code:"FINISHED"}));return;}trialParams=url.searchParams.get("trial_params");res.end(JSON.stringify({id:"trial-container-1"}));});
+  t.after(()=>mock.server.close());
+  process.env.META_GRAPH_BASE=mock.url;process.env.META_GRAPH_VERSION="v24.0";delete process.env.INSTAGRAM_TRIAL_REELS_ENABLED;
+  const result=await publishReel({instagramUserId:"ig-user",accessToken:"token"},"https://example.invalid/video.mp4","caption",false,undefined,"SS_PERFORMANCE",{beforePublish:()=>{pending=true;}});
+  assert.equal(result.id,"trial-media-123");
+  assert.equal(trialParams,JSON.stringify({graduation_strategy:"SS_PERFORMANCE"}));
+  assert.equal(publishCalls,1);
+});
+
+test("Meta Trial Reel container rejection never falls back to a regular Reel",async t=>{
+  let containerCalls=0;let publishCalls=0;
+  const mock=await listen((req,res)=>{const url=new URL(req.url,"http://localhost");res.setHeader("content-type","application/json");if(url.pathname.endsWith("/media_publish")){publishCalls++;res.end(JSON.stringify({id:"unexpected"}));return;}containerCalls++;assert.ok(url.searchParams.has("trial_params"));res.writeHead(400);res.end(JSON.stringify({error:{message:"Unsupported trial_params",code:100}}));});
+  t.after(()=>mock.server.close());
+  process.env.META_GRAPH_BASE=mock.url;process.env.META_GRAPH_VERSION="v24.0";delete process.env.INSTAGRAM_TRIAL_REELS_ENABLED;
+  await assert.rejects(()=>publishReel({instagramUserId:"ig-user",accessToken:"token"},"https://example.invalid/video.mp4",undefined,true,undefined,"MANUAL"),/Unsupported trial_params/);
+  assert.equal(containerCalls,1);
+  assert.equal(publishCalls,0);
 });
 

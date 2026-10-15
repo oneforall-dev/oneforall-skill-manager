@@ -1,5 +1,6 @@
 export type PublishResult = { id: string };
 export type IgCredentials = { instagramUserId: string; accessToken: string };
+export type TrialReelGraduationStrategy = "MANUAL" | "SS_PERFORMANCE";
 
 type GraphError = { error?: { message?: string; type?: string; code?: number; error_subcode?: number } };
 export class InstagramApiError extends Error {
@@ -45,8 +46,19 @@ export async function createImageContainer(creds: IgCredentials, imageUrl: strin
 export async function createCarouselContainer(creds: IgCredentials, children: string[], caption?: string) {
   return graph<{id:string}>(creds, `${creds.instagramUserId}/media`, "POST", { media_type:"CAROUSEL", children:children.join(","), caption });
 }
-export async function createReelContainer(creds: IgCredentials, videoUrl: string, caption?: string, shareToFeed = true, coverUrl?: string) {
-  return graph<{id:string}>(creds, `${creds.instagramUserId}/media`, "POST", { media_type:"REELS", video_url:videoUrl, caption, share_to_feed:shareToFeed, cover_url:coverUrl });
+export function reelContainerParams(videoUrl: string, caption?: string, shareToFeed = true, coverUrl?: string, trialGraduationStrategy?: TrialReelGraduationStrategy) {
+  return {
+    media_type:"REELS",
+    video_url:videoUrl,
+    caption,
+    share_to_feed:shareToFeed,
+    cover_url:coverUrl,
+    trial_params:trialGraduationStrategy?JSON.stringify({graduation_strategy:trialGraduationStrategy}):undefined
+  };
+}
+export async function createReelContainer(creds: IgCredentials, videoUrl: string, caption?: string, shareToFeed = true, coverUrl?: string, trialGraduationStrategy?: TrialReelGraduationStrategy) {
+  if(trialGraduationStrategy&&process.env.INSTAGRAM_TRIAL_REELS_ENABLED==="false") throw new Error("TRIAL_REELS_DISABLED: server capability flag is off");
+  return graph<{id:string}>(creds, `${creds.instagramUserId}/media`, "POST", reelContainerParams(videoUrl,caption,shareToFeed,coverUrl,trialGraduationStrategy));
 }
 export async function getContainerStatus(creds: IgCredentials, containerId: string) {
   return graph<{id:string;status_code?:string;status?:string}>(creds, `${containerId}?fields=id,status_code,status`, "GET");
@@ -87,8 +99,8 @@ export async function publishCarousel(creds: IgCredentials, imageUrls: string[],
   await hooks.beforePublish?.();
   return publishContainer(creds, parent.id);
 }
-export async function publishReel(creds: IgCredentials, videoUrl: string, caption?: string, shareToFeed = true, coverUrl?: string,hooks:PublishHooks={}) {
-  const c = await createReelContainer(creds, videoUrl, caption, shareToFeed, coverUrl);
+export async function publishReel(creds: IgCredentials, videoUrl: string, caption?: string, shareToFeed = true, coverUrl?: string,trialGraduationStrategy?:TrialReelGraduationStrategy,hooks:PublishHooks={}) {
+  const c = await createReelContainer(creds, videoUrl, caption, shareToFeed, coverUrl,trialGraduationStrategy);
   await waitForContainer(creds, c.id);
   await hooks.beforePublish?.();
   return publishContainer(creds, c.id);
