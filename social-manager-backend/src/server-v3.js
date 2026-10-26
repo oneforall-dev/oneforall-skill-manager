@@ -10,7 +10,7 @@ import { createHash, randomUUID } from 'node:crypto';
 const { Pool } = pg;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-const VERSION = '0.7.0';
+const VERSION = '0.8.0';
 const AUTH_ENABLED = /^(1|true|yes)$/i.test(process.env.AUTH_ENABLED ?? 'false');
 const AUTH_ISSUER = process.env.AUTH_ISSUER;
 const AUTH_AUDIENCE = process.env.AUTH_AUDIENCE;
@@ -295,6 +295,14 @@ async function ensureAutomationSchema() {
       audited_at timestamptz NOT NULL,
       created_at timestamptz NOT NULL DEFAULT now()
     );
+    CREATE TABLE IF NOT EXISTS release_factor_approvals (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),client_slug text NOT NULL,item_id text NOT NULL,
+      content_version integer NOT NULL CHECK(content_version>0),content_hash text NOT NULL,destination_id text NOT NULL,
+      factor text NOT NULL CHECK(factor IN ('agency','director','auditor')),
+      verdict text NOT NULL CHECK(verdict IN ('PASS','CORRECTIONS','BLOCKED')),client_profile_revision integer,
+      evidence jsonb NOT NULL,actor_receipt jsonb NOT NULL,approved_at timestamptz NOT NULL,created_at timestamptz NOT NULL DEFAULT now(),
+      UNIQUE(client_slug,item_id,content_version,content_hash,destination_id,factor)
+    );
   `);
 }
 
@@ -469,6 +477,41 @@ async function getAuditResult(input) {
   if (input.audit_id) return (await query('SELECT * FROM audit_results WHERE audit_id=$1',[input.audit_id]))[0] ?? null;
   return (await query(`SELECT * FROM audit_results WHERE client_slug=$1 AND item_id=$2 AND content_version=$3
     ORDER BY audited_at DESC LIMIT 1`,[input.client_slug,input.item_id,input.content_version]))[0] ?? null;
+}
+
+async function recordReleaseFactor(input) {
+  const rows = await query(`
+    INSERT INTO release_factor_approvals
+      (client_slug,item_id,content_version,content_hash,destination_id,factor,verdict,client_profile_revision,evidence,actor_receipt,approved_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11)
+    ON CONFLICT(client_slug,item_id,content_version,content_hash,destination_id,factor) DO UPDATE SET
+      verdict=EXCLUDED.verdict,client_profile_revision=EXCLUDED.client_profile_revision,evidence=EXCLUDED.evidence,
+      actor_receipt=EXCLUDED.actor_receipt,approved_at=EXCLUDED.approved_at
+    RETURNING *
+  `,[input.client_slug,input.item_id,input.content_version,input.content_hash.toLowerCase(),input.destination_id,input.factor,
+    input.verdict,input.client_profile_revision ?? null,JSON.stringify(input.evidence),JSON.stringify(input.actor_receipt),input.approved_at]);
+  return rows[0];
+}
+
+async function evaluateOwnerApprovalReadiness(input) {
+  const factors = await query(`
+    SELECT factor,verdict,client_profile_revision,evidence,actor_receipt,approved_at
+    FROM release_factor_approvals
+    WHERE client_slug=$1 AND item_id=$2 AND content_version=$3 AND content_hash=$4 AND destination_id=$5
+  `,[input.client_slug,input.item_id,input.content_version,input.content_hash.toLowerCase(),input.destination_id]);
+  const required = ['agency','director','auditor'];
+  const byFactor = Object.fromEntries(factors.map(row => [row.factor,row]));
+  const missing = required.filter(factor => !byFactor[factor]);
+  const negative = required.filter(factor => byFactor[factor] && byFactor[factor].verdict !== 'PASS');
+  const status = negative.length ? 'BLOCKED' : missing.length ? 'WAITING' : 'READY_FOR_OWNER_APPROVAL';
+  return {
+    status,ready:status === 'READY_FOR_OWNER_APPROVAL',client_slug:input.client_slug,item_id:input.item_id,
+    content_version:input.content_version,content_hash:input.content_hash.toLowerCase(),destination_id:input.destination_id,
+    approvals:byFactor,missing_factors:missing,blocking_factors:negative,
+    next_action:status === 'READY_FOR_OWNER_APPROVAL' ? 'SHOW_EXACT_PACKAGE_TO_OWNER' :
+      status === 'BLOCKED' ? 'RETURN_TO_RESPONSIBLE_ACTOR_OR_REQUEST_OWNER_OVERRIDE' : 'COLLECT_MISSING_REVIEWS',
+    authorization_created:false
+  };
 }
 
 async function createContent(input) {
@@ -848,6 +891,22 @@ function buildMcpServer(principal) {
     return toolResult({audit:await getAuditResult(input)});
   });
 
+  tool('record_release_review','Record an Agency, Director or Auditor review for one exact content fingerprint and destination. This is advisory workflow evidence only: it never authorizes publication, never impersonates an authenticated actor and never creates an Auditor signature or owner approval.',{
+    client_slug:z.string(),item_id:z.string().min(1).max(180),content_version:z.number().int().positive(),
+    content_hash:z.string().regex(/^[0-9a-f]{64}$/i),destination_id:z.string().min(1).max(240),
+    factor:z.enum(['agency','director','auditor']),verdict:z.enum(['PASS','CORRECTIONS','BLOCKED']),
+    client_profile_revision:z.number().int().positive().optional(),evidence:z.array(z.record(z.any())).min(1),
+    actor_receipt:z.record(z.any()),reviewed_at:z.string().datetime({offset:true}).optional()
+  },['social.write'],async input => toolResult({
+    review:await recordReleaseFactor({...input,approved_at:input.reviewed_at ?? new Date().toISOString()}),
+    authorization_created:false
+  }));
+
+  tool('evaluate_owner_approval_readiness','Check whether Agency, Director and Auditor all recorded PASS for the same client, ITEM_ID, version, fingerprint and destination. READY_FOR_OWNER_APPROVAL is not publication authorization: the owner must still approve the exact Publisher item, or explicitly register OWNER_OVERRIDE.',{
+    client_slug:z.string(),item_id:z.string().min(1).max(180),content_version:z.number().int().positive(),
+    content_hash:z.string().regex(/^[0-9a-f]{64}$/i),destination_id:z.string().min(1).max(240)
+  },['social.read'],async input => toolResult(await evaluateOwnerApprovalReadiness(input)));
+
   tool('transition_content_item','Change a content item state and record an immutable event',{
     content_id:z.string().uuid(),status:z.enum(STATUSES),actor:z.string().optional(),scheduled_at:z.string().optional(),published_at:z.string().optional(),publisher_post_id:z.string().optional(),published_url:z.string().optional(),asset_ids:z.array(z.string()).optional(),caption:z.string().optional(),approval_receipt:z.record(z.any()).optional(),google_calendar_id:z.string().optional(),google_calendar_event_id:z.string().optional(),calendar_sync_status:z.string().optional(),metadata:z.record(z.any()).optional()
   },['social.write'],async ({content_id,status,actor,...patch}) => toolResult(await transitionContent(content_id,status,actor,patch)));
@@ -917,3 +976,4 @@ ensureDiscoverySchema()
   .then(() => ensureAutomationSchema())
   .then(() => app.listen(port, () => console.log(`Oneforall Social Manager ${VERSION} listening on ${port}`)))
   .catch(error => { console.error('Database schema initialization failed', error); process.exit(1); });
+

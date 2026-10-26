@@ -106,3 +106,22 @@ CREATE TABLE IF NOT EXISTS audit_results (
 
 CREATE INDEX IF NOT EXISTS idx_audit_results_item
   ON audit_results (client_slug, item_id, content_version, audited_at DESC);
+
+CREATE TABLE IF NOT EXISTS release_factor_approvals (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_slug text NOT NULL,
+  item_id text NOT NULL,
+  content_version integer NOT NULL CHECK (content_version > 0),
+  content_hash text NOT NULL,
+  destination_id text NOT NULL,
+  factor text NOT NULL CHECK (factor IN ('agency','director','auditor')),
+  verdict text NOT NULL CHECK (verdict IN ('PASS','CORRECTIONS','BLOCKED')),
+  client_profile_revision integer,
+  evidence jsonb NOT NULL,
+  actor_receipt jsonb NOT NULL,
+  approved_at timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(client_slug,item_id,content_version,content_hash,destination_id,factor)
+);
+
+
