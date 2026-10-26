@@ -10,7 +10,7 @@ import { createHash, randomUUID } from 'node:crypto';
 const { Pool } = pg;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-const VERSION = '0.10.0';
+const VERSION = '0.10.1';
 const AUTH_ENABLED = /^(1|true|yes)$/i.test(process.env.AUTH_ENABLED ?? 'false');
 const AUTH_ISSUER = process.env.AUTH_ISSUER;
 const AUTH_AUDIENCE = process.env.AUTH_AUDIENCE;
@@ -1015,11 +1015,14 @@ async function runContentSupply(input) {
   const generationCount = input.trigger_source === 'manual' && input.requested_count != null
     ? input.requested_count : thresholdGeneration;
   const scheduleCount = Math.max(policy.minimum_scheduled_items - inventory.scheduled_future,0);
+  const scheduleReadyCount = Math.min(scheduleCount,inventory.approved_unscheduled);
   const decision = {
     generation_required:generationCount > 0,
     generation_count:generationCount,
     scheduling_required:scheduleCount > 0,
     scheduling_count:scheduleCount,
+    scheduling_order_count:scheduleReadyCount,
+    scheduling_deferred_count:scheduleCount - scheduleReadyCount,
     lead_time_warning:inventory.lead_time_violations > 0,
     trigger_source:input.trigger_source,
     owner_approval_required:policy.owner_approval_required
@@ -1043,11 +1046,11 @@ async function runContentSupply(input) {
       VALUES($1,'director','GENERATE_CONTENT_BATCH',$2,$3,$4::jsonb)
     `,[run.id,sequence++,researchOrder?.id ?? null,JSON.stringify({...sharedPayload,count:generationCount,research_order_id:researchOrder?.id ?? null})]);
   }
-  if (scheduleCount > 0) {
+  if (scheduleReadyCount > 0) {
     await query(`
       INSERT INTO content_supply_orders(run_id,actor,action_type,sequence,payload)
       VALUES($1,'social-manager','SCHEDULE_READY_CONTENT',$2,$3::jsonb)
-    `,[run.id,sequence++,JSON.stringify({...sharedPayload,count:scheduleCount,lead_days:policy.lead_days})]);
+    `,[run.id,sequence++,JSON.stringify({...sharedPayload,count:scheduleReadyCount,lead_days:policy.lead_days,approved_content_only:true})]);
   }
   const status = sequence === 1 ? 'NO_ACTION' : 'ORDERS_PENDING';
   run = (await query(`UPDATE content_supply_runs SET status=$2,inventory_snapshot=$3::jsonb,decision=$4::jsonb,updated_at=now() WHERE id=$1 RETURNING *`,[
