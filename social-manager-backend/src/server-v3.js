@@ -10,7 +10,7 @@ import { createHash, randomUUID } from 'node:crypto';
 const { Pool } = pg;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-const VERSION = '0.8.0';
+const VERSION = '0.9.0';
 const AUTH_ENABLED = /^(1|true|yes)$/i.test(process.env.AUTH_ENABLED ?? 'false');
 const AUTH_ISSUER = process.env.AUTH_ISSUER;
 const AUTH_AUDIENCE = process.env.AUTH_AUDIENCE;
@@ -303,6 +303,51 @@ async function ensureAutomationSchema() {
       evidence jsonb NOT NULL,actor_receipt jsonb NOT NULL,approved_at timestamptz NOT NULL,created_at timestamptz NOT NULL DEFAULT now(),
       UNIQUE(client_slug,item_id,content_version,content_hash,destination_id,factor)
     );
+    CREATE TABLE IF NOT EXISTS automatic_orchestration_runs (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      client_slug text NOT NULL,
+      content_id uuid NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+      item_id text NOT NULL,
+      content_version integer NOT NULL CHECK(content_version > 0),
+      council_id uuid REFERENCES creative_councils(id) ON DELETE SET NULL,
+      phase text NOT NULL DEFAULT 'CONCEPT_COUNCIL' CHECK(phase IN (
+        'CONCEPT_COUNCIL','CONCEPT_REVISION','PRODUCTION','FINAL_REVIEW','FINAL_CORRECTION','OWNER_DECISION','COMPLETE'
+      )),
+      status text NOT NULL DEFAULT 'RUNNING' CHECK(status IN (
+        'RUNNING','WAITING_ACTOR','CORRECTIONS','BLOCKED','USER_APPROVAL_REQUIRED','COMPLETE'
+      )),
+      correction_round integer NOT NULL DEFAULT 0 CHECK(correction_round >= 0),
+      max_correction_rounds integer NOT NULL DEFAULT 3 CHECK(max_correction_rounds > 0),
+      content_hash text,
+      destination_id text,
+      final_package jsonb,
+      exact_blocker jsonb,
+      owner_override_allowed boolean NOT NULL DEFAULT true,
+      last_transition jsonb NOT NULL DEFAULT '{}'::jsonb,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      UNIQUE(client_slug,item_id,content_version)
+    );
+    CREATE TABLE IF NOT EXISTS automatic_actor_actions (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      run_id uuid NOT NULL REFERENCES automatic_orchestration_runs(id) ON DELETE CASCADE,
+      phase text NOT NULL,
+      actor text NOT NULL CHECK(actor IN ('agency','director','auditor','social-manager','owner')),
+      action_type text NOT NULL,
+      status text NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','CLAIMED','COMPLETED','BLOCKED','CANCELLED')),
+      attempt integer NOT NULL DEFAULT 1 CHECK(attempt > 0),
+      package_hash text,
+      payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+      result jsonb,
+      claimed_by text,
+      claimed_at timestamptz,
+      completed_at timestamptz,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      UNIQUE(run_id,phase,actor,action_type,attempt)
+    );
+    CREATE INDEX IF NOT EXISTS idx_automatic_actions_pending
+      ON automatic_actor_actions(status,actor,created_at);
   `);
 }
 
@@ -410,6 +455,12 @@ async function recordCouncilVerdict(input) {
   const council = await getCreativeCouncil({council_id:input.council_id});
   if (!council) throw new Error('Creative council not found');
   if (council.package_hash !== input.expected_package_hash) throw new Error('COUNCIL_PACKAGE_MISMATCH');
+  if (input.verdict === 'CORRECTIONS' && !Array.isArray(input.receipt?.corrections)) {
+    throw new Error('COUNCIL_CORRECTIONS_REQUIRE_EXPLICIT_CORRECTIONS');
+  }
+  if (input.verdict === 'BLOCKED' && (!input.receipt?.blocker || typeof input.receipt.blocker !== 'object')) {
+    throw new Error('COUNCIL_BLOCKED_REQUIRES_EXACT_BLOCKER');
+  }
   const verdictColumn = `${input.role}_verdict`;
   const receiptColumn = `${input.role}_receipt`;
   const allowedColumns = new Set(['agency_verdict','agency_receipt','director_verdict','director_receipt','auditor_verdict','auditor_receipt']);
@@ -512,6 +563,198 @@ async function evaluateOwnerApprovalReadiness(input) {
       status === 'BLOCKED' ? 'RETURN_TO_RESPONSIBLE_ACTOR_OR_REQUEST_OWNER_OVERRIDE' : 'COLLECT_MISSING_REVIEWS',
     authorization_created:false
   };
+}
+
+async function getAutomaticRun(runId) {
+  return (await query('SELECT * FROM automatic_orchestration_runs WHERE id=$1',[runId]))[0] ?? null;
+}
+
+async function getAutomaticRunSnapshot(runId) {
+  const run = await getAutomaticRun(runId);
+  if (!run) throw new Error('AUTOMATIC_ORCHESTRATION_RUN_NOT_FOUND');
+  const [actions,council,item] = await Promise.all([
+    query('SELECT * FROM automatic_actor_actions WHERE run_id=$1 ORDER BY created_at,id',[runId]),
+    run.council_id ? getCreativeCouncil({council_id:run.council_id}) : null,
+    query('SELECT * FROM content_items WHERE id=$1',[run.content_id]).then(rows => rows[0] ?? null)
+  ]);
+  return {run,council,item,actions};
+}
+
+async function setAutomaticRun(runId, patch) {
+  const allowed = new Set(['content_version','council_id','phase','status','correction_round','content_hash','destination_id','final_package','exact_blocker','last_transition']);
+  const entries = Object.entries(patch).filter(([key]) => allowed.has(key));
+  if (!entries.length) return getAutomaticRun(runId);
+  const values = [runId];
+  const assignments = entries.map(([key,value]) => {
+    values.push(key === 'final_package' || key === 'exact_blocker' || key === 'last_transition' ? JSON.stringify(value) : value);
+    const cast = key === 'final_package' || key === 'exact_blocker' || key === 'last_transition' ? '::jsonb' : '';
+    return `${key}=$${values.length}${cast}`;
+  });
+  return (await query(`UPDATE automatic_orchestration_runs SET ${assignments.join(',')},updated_at=now() WHERE id=$1 RETURNING *`,values))[0];
+}
+
+async function enqueueAutomaticAction(run, input) {
+  const attempt = input.attempt ?? (run.correction_round + 1);
+  const rows = await query(`
+    INSERT INTO automatic_actor_actions(run_id,phase,actor,action_type,attempt,package_hash,payload)
+    VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)
+    ON CONFLICT(run_id,phase,actor,action_type,attempt) DO UPDATE SET
+      payload=EXCLUDED.payload,package_hash=EXCLUDED.package_hash,updated_at=now()
+    RETURNING *
+  `,[run.id,input.phase,input.actor,input.action_type,attempt,input.package_hash ?? null,JSON.stringify(input.payload ?? {})]);
+  return rows[0];
+}
+
+function exactCouncilBlocker(council) {
+  for (const actor of ['agency','director','auditor']) {
+    if (council?.[`${actor}_verdict`] !== 'BLOCKED') continue;
+    const receipt = council[`${actor}_receipt`] ?? {};
+    return {actor,stage:'CONCEPT_COUNCIL',...(receipt.blocker ?? {code:'BLOCKER_DETAILS_MISSING',message:'The blocking actor did not provide an exact blocker'})};
+  }
+  return null;
+}
+
+async function reconcileAutomaticRun(runId) {
+  let run = await getAutomaticRun(runId);
+  if (!run) throw new Error('AUTOMATIC_ORCHESTRATION_RUN_NOT_FOUND');
+  if (['BLOCKED','USER_APPROVAL_REQUIRED','COMPLETE'].includes(run.status)) return getAutomaticRunSnapshot(runId);
+
+  if (['CONCEPT_COUNCIL','CONCEPT_REVISION'].includes(run.phase)) {
+    const council = await getCreativeCouncil({council_id:run.council_id});
+    if (!council) throw new Error('AUTOMATIC_COUNCIL_NOT_FOUND');
+    if (council.status === 'BLOCKED') {
+      run = await setAutomaticRun(runId,{status:'BLOCKED',exact_blocker:exactCouncilBlocker(council),last_transition:{reason:'COUNCIL_BLOCKED',at:new Date().toISOString()}});
+      await query("UPDATE automatic_actor_actions SET status='CANCELLED',updated_at=now() WHERE run_id=$1 AND status IN ('PENDING','CLAIMED')",[runId]);
+      return getAutomaticRunSnapshot(runId);
+    }
+    if (council.status === 'CORRECTIONS') {
+      run = await setAutomaticRun(runId,{phase:'CONCEPT_REVISION',status:'CORRECTIONS',last_transition:{reason:'COUNCIL_CORRECTIONS',at:new Date().toISOString()}});
+      await query("UPDATE automatic_actor_actions SET status='CANCELLED',updated_at=now() WHERE run_id=$1 AND phase='CONCEPT_COUNCIL' AND status IN ('PENDING','CLAIMED')",[runId]);
+      await enqueueAutomaticAction(run,{phase:'CONCEPT_REVISION',actor:'director',action_type:'REVISE_CONCEPT',package_hash:council.package_hash,payload:{council_id:council.id,corrections:{agency:council.agency_receipt?.corrections ?? [],director:council.director_receipt?.corrections ?? [],auditor:council.auditor_receipt?.corrections ?? []}}});
+      return getAutomaticRunSnapshot(runId);
+    }
+    if (council.status === 'CONCEPT_LOCKED') {
+      run = await setAutomaticRun(runId,{phase:'PRODUCTION',status:'RUNNING',last_transition:{reason:'ALL_COUNCIL_FACTORS_PASS',at:new Date().toISOString()}});
+      await query("UPDATE automatic_actor_actions SET status='CANCELLED',updated_at=now() WHERE run_id=$1 AND status IN ('PENDING','CLAIMED')",[runId]);
+      await enqueueAutomaticAction(run,{phase:'PRODUCTION',actor:'director',action_type:'PRODUCE_LOCKED_CONCEPT',package_hash:council.package_hash,payload:{council_id:council.id,concept_package:council.concept_package,client_profile_revision:council.client_profile_revision}});
+      return getAutomaticRunSnapshot(runId);
+    }
+    for (const actor of ['agency','director','auditor']) {
+      if (!council[`${actor}_verdict`]) await enqueueAutomaticAction(run,{phase:'CONCEPT_COUNCIL',actor,action_type:'REVIEW_CONCEPT',package_hash:council.package_hash,payload:{council_id:council.id,concept_package:council.concept_package,client_profile_revision:council.client_profile_revision}});
+    }
+    await setAutomaticRun(runId,{phase:'CONCEPT_COUNCIL',status:'WAITING_ACTOR',last_transition:{reason:'COUNCIL_ACTIONS_DISPATCHED',at:new Date().toISOString()}});
+    return getAutomaticRunSnapshot(runId);
+  }
+
+  if (run.phase === 'PRODUCTION') {
+    const council = await getCreativeCouncil({council_id:run.council_id});
+    if (!council || council.status !== 'CONCEPT_LOCKED') throw new Error('PRODUCTION_REQUIRES_CONCEPT_LOCKED');
+    await enqueueAutomaticAction(run,{phase:'PRODUCTION',actor:'director',action_type:'PRODUCE_LOCKED_CONCEPT',package_hash:council.package_hash,payload:{council_id:council.id,concept_package:council.concept_package,client_profile_revision:council.client_profile_revision}});
+    await setAutomaticRun(runId,{status:'WAITING_ACTOR',last_transition:{reason:'DIRECTOR_PRODUCTION_DISPATCHED',at:new Date().toISOString()}});
+    return getAutomaticRunSnapshot(runId);
+  }
+
+  if (run.phase === 'FINAL_REVIEW') {
+    if (!run.content_hash || !run.destination_id) throw new Error('FINAL_PACKAGE_FINGERPRINT_REQUIRED');
+    const reviews = await query(`SELECT * FROM release_factor_approvals WHERE client_slug=$1 AND item_id=$2 AND content_version=$3 AND content_hash=$4 AND destination_id=$5`,[run.client_slug,run.item_id,run.content_version,run.content_hash,run.destination_id]);
+    const byActor = Object.fromEntries(reviews.map(row => [row.factor,row]));
+    const blocked = reviews.find(row => row.verdict === 'BLOCKED');
+    if (blocked) {
+      await setAutomaticRun(runId,{status:'BLOCKED',exact_blocker:{actor:blocked.factor,stage:'FINAL_REVIEW',evidence:blocked.evidence},last_transition:{reason:'FINAL_REVIEW_BLOCKED',at:new Date().toISOString()}});
+      return getAutomaticRunSnapshot(runId);
+    }
+    if (reviews.some(row => row.verdict === 'CORRECTIONS')) {
+      run = await setAutomaticRun(runId,{phase:'FINAL_CORRECTION',status:'CORRECTIONS',last_transition:{reason:'FINAL_REVIEW_CORRECTIONS',at:new Date().toISOString()}});
+      await query("UPDATE automatic_actor_actions SET status='CANCELLED',updated_at=now() WHERE run_id=$1 AND phase='FINAL_REVIEW' AND status IN ('PENDING','CLAIMED')",[runId]);
+      await enqueueAutomaticAction(run,{phase:'FINAL_CORRECTION',actor:'director',action_type:'CORRECT_FINAL_PACKAGE',payload:{current_content_hash:run.content_hash,corrections:Object.fromEntries(reviews.filter(row => row.verdict === 'CORRECTIONS').map(row => [row.factor,row.evidence]))}});
+      return getAutomaticRunSnapshot(runId);
+    }
+    if (['agency','director','auditor'].every(actor => byActor[actor]?.verdict === 'PASS')) {
+      await setAutomaticRun(runId,{phase:'OWNER_DECISION',status:'USER_APPROVAL_REQUIRED',last_transition:{reason:'ALL_FINAL_FACTORS_PASS',next_action:'SHOW_EXACT_PACKAGE_TO_OWNER',at:new Date().toISOString()}});
+      await query(`UPDATE content_items SET status='approved',stage_owner='owner',next_action='SHOW_EXACT_PACKAGE_TO_OWNER',updated_at=now() WHERE id=$1`,[run.content_id]);
+      return getAutomaticRunSnapshot(runId);
+    }
+    for (const actor of ['agency','director','auditor']) {
+      if (!byActor[actor]) await enqueueAutomaticAction(run,{phase:'FINAL_REVIEW',actor,action_type:'REVIEW_FINAL_PACKAGE',payload:{content_hash:run.content_hash,destination_id:run.destination_id,final_package:run.final_package}});
+    }
+    await setAutomaticRun(runId,{status:'WAITING_ACTOR',last_transition:{reason:'FINAL_REVIEW_ACTIONS_DISPATCHED',at:new Date().toISOString()}});
+  }
+  return getAutomaticRunSnapshot(runId);
+}
+
+async function startAutomaticOrchestration(input) {
+  const item = (await query(`SELECT * FROM content_items WHERE client_slug=$1 AND item_id=$2`,[input.client_slug,input.item_id]))[0];
+  if (!item) throw new Error('CONTENT_ITEM_NOT_FOUND');
+  if (item.content_version !== input.content_version) throw new Error(`CONTENT_VERSION_MISMATCH: current=${item.content_version}`);
+  const council = await getCreativeCouncil({client_slug:input.client_slug,item_id:input.item_id,content_version:input.content_version});
+  if (!council) throw new Error('CREATIVE_COUNCIL_REQUIRED');
+  const profile = await getClientProfile(input.client_slug);
+  if (!profile || profile.revision !== council.client_profile_revision) throw new Error('CLIENT_PROFILE_REVISION_MISMATCH');
+  const initialPhase = council.status === 'CONCEPT_LOCKED' ? 'PRODUCTION' : council.status === 'CORRECTIONS' ? 'CONCEPT_REVISION' : 'CONCEPT_COUNCIL';
+  const rows = await query(`
+    INSERT INTO automatic_orchestration_runs(client_slug,content_id,item_id,content_version,council_id,phase,status,max_correction_rounds,owner_override_allowed,last_transition)
+    VALUES($1,$2,$3,$4,$5,$6,'RUNNING',$7,true,$8::jsonb)
+    ON CONFLICT(client_slug,item_id,content_version) DO UPDATE SET
+      content_id=EXCLUDED.content_id,council_id=EXCLUDED.council_id,max_correction_rounds=EXCLUDED.max_correction_rounds,
+      owner_override_allowed=true,updated_at=now()
+    RETURNING *
+  `,[input.client_slug,item.id,input.item_id,input.content_version,council.id,initialPhase,input.max_correction_rounds ?? 3,JSON.stringify({reason:'AUTOMATIC_ORCHESTRATION_STARTED',at:new Date().toISOString()})]);
+  await query(`UPDATE content_items SET stage_owner='social-manager',next_action='AUTOMATIC_ORCHESTRATION',updated_at=now() WHERE id=$1`,[item.id]);
+  return reconcileAutomaticRun(rows[0].id);
+}
+
+async function claimAutomaticAction(input) {
+  const rows = await query(`
+    UPDATE automatic_actor_actions SET status='CLAIMED',claimed_by=$3,claimed_at=now(),updated_at=now()
+    WHERE id=(SELECT id FROM automatic_actor_actions WHERE run_id=$1 AND actor=$2 AND status='PENDING' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)
+    RETURNING *
+  `,[input.run_id,input.actor,input.claimed_by]);
+  return {action:rows[0] ?? null,run:await getAutomaticRun(input.run_id)};
+}
+
+async function completeAutomaticAction(input) {
+  const action = (await query('SELECT * FROM automatic_actor_actions WHERE id=$1',[input.action_id]))[0];
+  if (!action) throw new Error('AUTOMATIC_ACTION_NOT_FOUND');
+  if (action.status === 'COMPLETED') return getAutomaticRunSnapshot(action.run_id);
+  if (!['PENDING','CLAIMED'].includes(action.status)) throw new Error(`AUTOMATIC_ACTION_NOT_COMPLETABLE: ${action.status}`);
+  if (action.actor !== input.actor) throw new Error('AUTOMATIC_ACTION_ACTOR_MISMATCH');
+  if (action.claimed_by && action.claimed_by !== input.completed_by) throw new Error('AUTOMATIC_ACTION_CLAIM_IDENTITY_MISMATCH');
+  let run = await getAutomaticRun(action.run_id);
+  if (!run) throw new Error('AUTOMATIC_ORCHESTRATION_RUN_NOT_FOUND');
+  const result = input.result ?? {};
+
+  if (action.action_type === 'REVIEW_CONCEPT') {
+    await recordCouncilVerdict({council_id:run.council_id,expected_package_hash:action.package_hash,role:input.actor,verdict:input.verdict,receipt:result});
+  } else if (action.action_type === 'REVISE_CONCEPT') {
+    if (!result.concept_package) throw new Error('REVISED_CONCEPT_PACKAGE_REQUIRED');
+    if (run.correction_round >= run.max_correction_rounds) {
+      await setAutomaticRun(run.id,{status:'BLOCKED',exact_blocker:{code:'CONCEPT_CORRECTION_BUDGET_EXHAUSTED',rounds:run.correction_round},last_transition:{reason:'CORRECTION_BUDGET_EXHAUSTED',at:new Date().toISOString()}});
+    } else {
+      const council = await getCreativeCouncil({council_id:run.council_id});
+      const revised = await openCreativeCouncil({client_slug:run.client_slug,content_id:run.content_id,item_id:run.item_id,content_version:run.content_version,client_profile_revision:council.client_profile_revision,research_receipt_id:council.research_receipt_id,concept_package:result.concept_package});
+      run = await setAutomaticRun(run.id,{council_id:revised.id,phase:'CONCEPT_COUNCIL',status:'RUNNING',correction_round:run.correction_round+1,last_transition:{reason:'DIRECTOR_REVISED_CONCEPT',at:new Date().toISOString()}});
+    }
+  } else if (action.action_type === 'PRODUCE_LOCKED_CONCEPT' || action.action_type === 'CORRECT_FINAL_PACKAGE') {
+    if (action.action_type === 'CORRECT_FINAL_PACKAGE' && run.correction_round >= run.max_correction_rounds) {
+      await setAutomaticRun(run.id,{status:'BLOCKED',exact_blocker:{code:'FINAL_CORRECTION_BUDGET_EXHAUSTED',rounds:run.correction_round},last_transition:{reason:'CORRECTION_BUDGET_EXHAUSTED',at:new Date().toISOString()}});
+      await query(`UPDATE automatic_actor_actions SET status='BLOCKED',result=$2::jsonb,completed_at=now(),updated_at=now() WHERE id=$1`,[action.id,JSON.stringify({blocker:{code:'FINAL_CORRECTION_BUDGET_EXHAUSTED',rounds:run.correction_round}})]);
+      return getAutomaticRunSnapshot(run.id);
+    }
+    if (!result.content_hash || !/^[0-9a-f]{64}$/i.test(result.content_hash)) throw new Error('VALID_FINAL_CONTENT_HASH_REQUIRED');
+    if (!result.destination_id || !result.final_package) throw new Error('FINAL_PACKAGE_AND_DESTINATION_REQUIRED');
+    const nextVersion = result.content_version ?? run.content_version;
+    if (nextVersion < run.content_version) throw new Error('CONTENT_VERSION_CANNOT_DECREASE');
+    await query(`UPDATE content_items SET content_version=$2,status='audit',stage_owner='social-manager',next_action='RUN_FINAL_REVIEWS',asset_ids=COALESCE($3::jsonb,asset_ids),caption=COALESCE($4,caption),updated_at=now() WHERE id=$1`,[run.content_id,nextVersion,JSON.stringify(result.final_package.asset_ids ?? null),result.final_package.caption ?? null]);
+    run = await setAutomaticRun(run.id,{content_version:nextVersion,phase:'FINAL_REVIEW',status:'RUNNING',content_hash:result.content_hash.toLowerCase(),destination_id:result.destination_id,final_package:result.final_package,correction_round:action.action_type === 'CORRECT_FINAL_PACKAGE' ? run.correction_round+1 : run.correction_round,last_transition:{reason:action.action_type === 'PRODUCE_LOCKED_CONCEPT' ? 'PRODUCTION_COMPLETED' : 'FINAL_CORRECTION_COMPLETED',at:new Date().toISOString()}});
+  } else if (action.action_type === 'REVIEW_FINAL_PACKAGE') {
+    if (!Array.isArray(result.evidence) || result.evidence.length === 0) throw new Error('FINAL_REVIEW_EVIDENCE_REQUIRED');
+    if (input.verdict === 'CORRECTIONS' && (!Array.isArray(result.corrections) || result.corrections.length === 0)) throw new Error('FINAL_CORRECTIONS_REQUIRE_EXPLICIT_CORRECTIONS');
+    if (input.verdict === 'BLOCKED' && (!result.blocker || typeof result.blocker !== 'object')) throw new Error('FINAL_BLOCKED_REQUIRES_EXACT_BLOCKER');
+    await recordReleaseFactor({client_slug:run.client_slug,item_id:run.item_id,content_version:run.content_version,content_hash:run.content_hash,destination_id:run.destination_id,factor:input.actor,verdict:input.verdict,client_profile_revision:result.client_profile_revision ?? null,evidence:result.evidence,actor_receipt:{...result,actor:input.actor,verdict:input.verdict},approved_at:new Date().toISOString()});
+  }
+
+  await query(`UPDATE automatic_actor_actions SET status='COMPLETED',result=$2::jsonb,completed_at=now(),updated_at=now() WHERE id=$1`,[action.id,JSON.stringify({verdict:input.verdict ?? null,...result})]);
+  return reconcileAutomaticRun(action.run_id);
 }
 
 async function createContent(input) {
@@ -906,6 +1149,24 @@ function buildMcpServer(principal) {
     client_slug:z.string(),item_id:z.string().min(1).max(180),content_version:z.number().int().positive(),
     content_hash:z.string().regex(/^[0-9a-f]{64}$/i),destination_id:z.string().min(1).max(240)
   },['social.read'],async input => toolResult(await evaluateOwnerApprovalReadiness(input)));
+
+  tool('start_automatic_orchestration','Start or resume the persistent Automatic Council Orchestration state machine. It dispatches Agency OS, Director and Auditor actions without asking the owner to invoke plugins manually; it stops only for exact owner approval or a concrete blocker.',{
+    client_slug:z.string(),item_id:z.string().min(1).max(180),content_version:z.number().int().positive(),
+    max_correction_rounds:z.number().int().min(1).max(10).default(3)
+  },['social.write'],async input => toolResult(await startAutomaticOrchestration(input)));
+
+  tool('get_automatic_orchestration','Get the complete automatic orchestration run, actor queue, council and current content item.',{
+    run_id:z.string().uuid()
+  },['social.read'],async ({run_id}) => toolResult(await getAutomaticRunSnapshot(run_id)));
+
+  tool('claim_next_actor_action','Claim the next pending action for one identified Oneforall actor. The orchestrator must call this automatically when the actor is available; the owner must not be asked to invoke the plugin.',{
+    run_id:z.string().uuid(),actor:z.enum(['agency','director','auditor']),claimed_by:z.string().min(1).max(240)
+  },['social.write'],async input => toolResult(await claimAutomaticAction(input)));
+
+  tool('complete_actor_action','Persist the real result of a claimed Agency OS, Director or Auditor action and immediately advance the state machine. PASS continues, CORRECTIONS creates a Director revision action, and BLOCKED requires an exact blocker.',{
+    action_id:z.string().uuid(),actor:z.enum(['agency','director','auditor']),
+    completed_by:z.string().min(1).max(240),verdict:z.enum(['PASS','CORRECTIONS','BLOCKED']).optional(),result:z.record(z.any()).default({})
+  },['social.write'],async input => toolResult(await completeAutomaticAction(input)));
 
   tool('transition_content_item','Change a content item state and record an immutable event',{
     content_id:z.string().uuid(),status:z.enum(STATUSES),actor:z.string().optional(),scheduled_at:z.string().optional(),published_at:z.string().optional(),publisher_post_id:z.string().optional(),published_url:z.string().optional(),asset_ids:z.array(z.string()).optional(),caption:z.string().optional(),approval_receipt:z.record(z.any()).optional(),google_calendar_id:z.string().optional(),google_calendar_event_id:z.string().optional(),calendar_sync_status:z.string().optional(),metadata:z.record(z.any()).optional()
