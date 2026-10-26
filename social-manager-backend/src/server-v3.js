@@ -10,7 +10,7 @@ import { createHash, randomUUID } from 'node:crypto';
 const { Pool } = pg;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-const VERSION = '0.9.0';
+const VERSION = '0.10.0';
 const AUTH_ENABLED = /^(1|true|yes)$/i.test(process.env.AUTH_ENABLED ?? 'false');
 const AUTH_ISSUER = process.env.AUTH_ISSUER;
 const AUTH_AUDIENCE = process.env.AUTH_AUDIENCE;
@@ -22,6 +22,8 @@ const ALLOWED_EMAILS = new Set(
     .split(',').map(value => value.trim().toLowerCase()).filter(Boolean)
 );
 const OAUTH_SCOPES = ['social.read','social.write','social.publish','social.admin'];
+const SUPPLY_SCHEDULER_ENABLED = !/^(0|false|no)$/i.test(process.env.SUPPLY_SCHEDULER_ENABLED ?? 'true');
+const SUPPLY_SCHEDULER_INTERVAL_MS = Math.max(Number(process.env.SUPPLY_SCHEDULER_INTERVAL_MS ?? 60000),15000);
 let remoteJwks;
 const STATUSES = [
   'idea','generated','in_production','produced','audit','needs_revision',
@@ -348,6 +350,76 @@ async function ensureAutomationSchema() {
     );
     CREATE INDEX IF NOT EXISTS idx_automatic_actions_pending
       ON automatic_actor_actions(status,actor,created_at);
+  `);
+}
+
+async function ensureSupplySchema() {
+  await query(`
+    ALTER TABLE content_items
+      ADD COLUMN IF NOT EXISTS scheduled_recorded_at timestamptz;
+    CREATE TABLE IF NOT EXISTS content_supply_policies (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      client_slug text NOT NULL,
+      campaign text NOT NULL DEFAULT 'default',
+      platform text NOT NULL DEFAULT 'instagram',
+      automation_enabled boolean NOT NULL DEFAULT false,
+      manual_enabled boolean NOT NULL DEFAULT true,
+      timezone text NOT NULL DEFAULT 'America/Bogota',
+      daily_trigger_time time NOT NULL DEFAULT '09:00',
+      lead_days integer NOT NULL DEFAULT 3 CHECK(lead_days >= 0),
+      minimum_ready_items integer NOT NULL DEFAULT 6 CHECK(minimum_ready_items >= 0),
+      target_ready_items integer NOT NULL DEFAULT 10 CHECK(target_ready_items >= minimum_ready_items),
+      minimum_scheduled_items integer NOT NULL DEFAULT 3 CHECK(minimum_scheduled_items >= 0),
+      publication_order jsonb NOT NULL DEFAULT '[]'::jsonb,
+      production_instructions jsonb NOT NULL DEFAULT '{}'::jsonb,
+      research_policy jsonb NOT NULL DEFAULT '{}'::jsonb,
+      owner_approval_required boolean NOT NULL DEFAULT true,
+      created_by text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      UNIQUE(client_slug,campaign,platform)
+    );
+    CREATE TABLE IF NOT EXISTS content_supply_runs (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      policy_id uuid NOT NULL REFERENCES content_supply_policies(id) ON DELETE CASCADE,
+      client_slug text NOT NULL,
+      campaign text NOT NULL,
+      platform text NOT NULL,
+      trigger_source text NOT NULL CHECK(trigger_source IN ('daily','manual')),
+      idempotency_key text,
+      local_date date NOT NULL,
+      status text NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','NO_ACTION','ORDERS_PENDING','COMPLETE','BLOCKED')),
+      inventory_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb,
+      decision jsonb NOT NULL DEFAULT '{}'::jsonb,
+      shown_at timestamptz,
+      requested_by text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_supply_daily_once
+      ON content_supply_runs(policy_id,local_date) WHERE trigger_source='daily';
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_supply_manual_idempotency
+      ON content_supply_runs(policy_id,idempotency_key)
+      WHERE trigger_source='manual' AND idempotency_key IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS content_supply_orders (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      run_id uuid NOT NULL REFERENCES content_supply_runs(id) ON DELETE CASCADE,
+      actor text NOT NULL CHECK(actor IN ('autopilot','director','social-manager')),
+      action_type text NOT NULL,
+      sequence integer NOT NULL CHECK(sequence > 0),
+      depends_on uuid REFERENCES content_supply_orders(id) ON DELETE SET NULL,
+      status text NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','CLAIMED','COMPLETED','BLOCKED','CANCELLED')),
+      payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+      result jsonb,
+      claimed_by text,
+      claimed_at timestamptz,
+      completed_at timestamptz,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      UNIQUE(run_id,sequence)
+    );
+    CREATE INDEX IF NOT EXISTS idx_supply_orders_pending
+      ON content_supply_orders(actor,status,created_at);
   `);
 }
 
@@ -798,6 +870,11 @@ async function transitionContent(id, toStatus, actor='social-manager', patch={})
       google_calendar_event_id=COALESCE($11,google_calendar_event_id),
       calendar_sync_status=COALESCE($12,calendar_sync_status),
       metadata=COALESCE(metadata,'{}'::jsonb) || COALESCE($13::jsonb,'{}'::jsonb),
+      scheduled_recorded_at=CASE
+        WHEN $2='scheduled' AND ($3::timestamptz IS NOT NULL OR scheduled_at IS NOT NULL)
+          THEN COALESCE(scheduled_recorded_at,now())
+        ELSE scheduled_recorded_at
+      END,
       updated_at=now()
     WHERE id=$1 RETURNING *
   `,[id,toStatus,patch.scheduled_at ?? null,patch.published_at ?? null,patch.publisher_post_id ?? null,patch.published_url ?? null,
@@ -823,6 +900,243 @@ async function dashboard(clientSlug,campaign='default',platform='instagram') {
     replenish:!!plan && future < plan.buffer_min,
     replenish_count:!!plan ? Math.max(plan.buffer_target - future,0) : null
   };
+}
+
+function zonedClock(timezone, instant = new Date()) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US',{
+    timeZone:timezone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'
+  }).formatToParts(instant).filter(part => part.type !== 'literal').map(part => [part.type,part.value]));
+  return {date:`${parts.year}-${parts.month}-${parts.day}`,time:`${parts.hour}:${parts.minute}:${parts.second}`};
+}
+
+function assertTimezone(timezone) {
+  try { zonedClock(timezone); }
+  catch { throw new Error(`INVALID_TIMEZONE: ${timezone}`); }
+}
+
+async function getContentSupplyPolicy(input) {
+  return (await query(`SELECT * FROM content_supply_policies WHERE client_slug=$1 AND campaign=$2 AND platform=$3`,[
+    input.client_slug,input.campaign ?? 'default',input.platform ?? 'instagram'
+  ]))[0] ?? null;
+}
+
+async function upsertContentSupplyPolicy(input) {
+  assertTimezone(input.timezone);
+  const profile = await getClientProfile(input.client_slug);
+  if (!profile) throw new Error('CLIENT_PROFILE_REQUIRED: Agency OS profile must exist before content supply automation is configured');
+  if (input.target_ready_items < input.minimum_ready_items) throw new Error('TARGET_READY_ITEMS_MUST_MEET_MINIMUM');
+  const rows = await query(`
+    INSERT INTO content_supply_policies
+      (client_slug,campaign,platform,automation_enabled,manual_enabled,timezone,daily_trigger_time,lead_days,
+       minimum_ready_items,target_ready_items,minimum_scheduled_items,publication_order,production_instructions,
+       research_policy,owner_approval_required,created_by,updated_at)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15,$16,now())
+    ON CONFLICT(client_slug,campaign,platform) DO UPDATE SET
+      automation_enabled=EXCLUDED.automation_enabled,manual_enabled=EXCLUDED.manual_enabled,timezone=EXCLUDED.timezone,
+      daily_trigger_time=EXCLUDED.daily_trigger_time,lead_days=EXCLUDED.lead_days,
+      minimum_ready_items=EXCLUDED.minimum_ready_items,target_ready_items=EXCLUDED.target_ready_items,
+      minimum_scheduled_items=EXCLUDED.minimum_scheduled_items,publication_order=EXCLUDED.publication_order,
+      production_instructions=EXCLUDED.production_instructions,research_policy=EXCLUDED.research_policy,
+      owner_approval_required=EXCLUDED.owner_approval_required,updated_at=now()
+    RETURNING *
+  `,[input.client_slug,input.campaign ?? 'default',input.platform ?? 'instagram',input.automation_enabled ?? false,
+    input.manual_enabled ?? true,input.timezone,input.daily_trigger_time,input.lead_days,input.minimum_ready_items,
+    input.target_ready_items,input.minimum_scheduled_items,JSON.stringify(input.publication_order ?? []),
+    JSON.stringify(input.production_instructions ?? {}),JSON.stringify(input.research_policy ?? {}),
+    input.owner_approval_required ?? true,input.created_by]);
+  return rows[0];
+}
+
+async function contentSupplyInventory(policy) {
+  const summary = (await query(`
+    SELECT
+      count(*) FILTER (WHERE status='approved')::int AS approved_unscheduled,
+      count(*) FILTER (WHERE status='scheduled' AND scheduled_at>now())::int AS scheduled_future,
+      max(scheduled_at) FILTER (WHERE status='scheduled' AND scheduled_at>now()) AS coverage_until,
+      count(*) FILTER (
+        WHERE status='scheduled' AND scheduled_at>now() AND scheduled_recorded_at IS NOT NULL
+          AND scheduled_at < scheduled_recorded_at + ($4::int * interval '1 day')
+      )::int AS lead_time_violations
+    FROM content_items
+    WHERE client_slug=$1 AND campaign=$2 AND platform=$3
+  `,[policy.client_slug,policy.campaign,policy.platform,policy.lead_days]))[0];
+  const readyInventory = summary.approved_unscheduled + summary.scheduled_future;
+  return {
+    approved_unscheduled:summary.approved_unscheduled,
+    scheduled_future:summary.scheduled_future,
+    ready_inventory:readyInventory,
+    coverage_until:summary.coverage_until,
+    lead_time_violations:summary.lead_time_violations,
+    minimum_ready_items:policy.minimum_ready_items,
+    target_ready_items:policy.target_ready_items,
+    minimum_scheduled_items:policy.minimum_scheduled_items,
+    lead_days:policy.lead_days
+  };
+}
+
+async function getContentSupplyRun(runId) {
+  const run = (await query('SELECT * FROM content_supply_runs WHERE id=$1',[runId]))[0] ?? null;
+  if (!run) throw new Error('CONTENT_SUPPLY_RUN_NOT_FOUND');
+  const [policy,orders] = await Promise.all([
+    query('SELECT * FROM content_supply_policies WHERE id=$1',[run.policy_id]).then(rows => rows[0] ?? null),
+    query('SELECT * FROM content_supply_orders WHERE run_id=$1 ORDER BY sequence',[runId])
+  ]);
+  return {run,policy,orders};
+}
+
+async function runContentSupply(input) {
+  const policy = await getContentSupplyPolicy(input);
+  if (!policy) throw new Error('CONTENT_SUPPLY_POLICY_NOT_FOUND');
+  if (input.trigger_source === 'daily' && !policy.automation_enabled) throw new Error('CONTENT_SUPPLY_AUTOMATION_DISABLED');
+  if (input.trigger_source === 'manual' && !policy.manual_enabled) throw new Error('CONTENT_SUPPLY_MANUAL_RUN_DISABLED');
+  if (input.trigger_source === 'manual' && !input.idempotency_key) throw new Error('MANUAL_IDEMPOTENCY_KEY_REQUIRED');
+  const clock = zonedClock(policy.timezone);
+  const insertSql = input.trigger_source === 'daily'
+    ? `INSERT INTO content_supply_runs(policy_id,client_slug,campaign,platform,trigger_source,local_date,requested_by)
+       VALUES($1,$2,$3,$4,'daily',$5,$6)
+       ON CONFLICT(policy_id,local_date) WHERE trigger_source='daily' DO NOTHING RETURNING *`
+    : `INSERT INTO content_supply_runs(policy_id,client_slug,campaign,platform,trigger_source,idempotency_key,local_date,requested_by)
+       VALUES($1,$2,$3,$4,'manual',$5,$6,$7)
+       ON CONFLICT(policy_id,idempotency_key) WHERE trigger_source='manual' AND idempotency_key IS NOT NULL DO NOTHING RETURNING *`;
+  const insertParams = input.trigger_source === 'daily'
+    ? [policy.id,policy.client_slug,policy.campaign,policy.platform,clock.date,input.requested_by]
+    : [policy.id,policy.client_slug,policy.campaign,policy.platform,input.idempotency_key,clock.date,input.requested_by];
+  let run = (await query(insertSql,insertParams))[0];
+  if (!run) {
+    const existing = input.trigger_source === 'daily'
+      ? await query(`SELECT * FROM content_supply_runs WHERE policy_id=$1 AND trigger_source='daily' AND local_date=$2`,[policy.id,clock.date])
+      : await query(`SELECT * FROM content_supply_runs WHERE policy_id=$1 AND trigger_source='manual' AND idempotency_key=$2`,[policy.id,input.idempotency_key]);
+    return {...await getContentSupplyRun(existing[0].id),created:false};
+  }
+
+  const inventory = await contentSupplyInventory(policy);
+  const thresholdGeneration = inventory.ready_inventory < policy.minimum_ready_items
+    ? Math.max(policy.target_ready_items - inventory.ready_inventory,0) : 0;
+  const generationCount = input.trigger_source === 'manual' && input.requested_count != null
+    ? input.requested_count : thresholdGeneration;
+  const scheduleCount = Math.max(policy.minimum_scheduled_items - inventory.scheduled_future,0);
+  const decision = {
+    generation_required:generationCount > 0,
+    generation_count:generationCount,
+    scheduling_required:scheduleCount > 0,
+    scheduling_count:scheduleCount,
+    lead_time_warning:inventory.lead_time_violations > 0,
+    trigger_source:input.trigger_source,
+    owner_approval_required:policy.owner_approval_required
+  };
+  let sequence = 1;
+  let researchOrder = null;
+  const sharedPayload = {
+    client_slug:policy.client_slug,campaign:policy.campaign,platform:policy.platform,
+    policy_id:policy.id,publication_order:policy.publication_order,
+    production_instructions:policy.production_instructions,owner_approval_required:policy.owner_approval_required
+  };
+  if (generationCount > 0 && policy.research_policy?.enabled) {
+    researchOrder = (await query(`
+      INSERT INTO content_supply_orders(run_id,actor,action_type,sequence,payload)
+      VALUES($1,'autopilot','REFRESH_CONTENT_RESEARCH',$2,$3::jsonb) RETURNING *
+    `,[run.id,sequence++,JSON.stringify({...sharedPayload,research_policy:policy.research_policy})]))[0];
+  }
+  if (generationCount > 0) {
+    await query(`
+      INSERT INTO content_supply_orders(run_id,actor,action_type,sequence,depends_on,payload)
+      VALUES($1,'director','GENERATE_CONTENT_BATCH',$2,$3,$4::jsonb)
+    `,[run.id,sequence++,researchOrder?.id ?? null,JSON.stringify({...sharedPayload,count:generationCount,research_order_id:researchOrder?.id ?? null})]);
+  }
+  if (scheduleCount > 0) {
+    await query(`
+      INSERT INTO content_supply_orders(run_id,actor,action_type,sequence,payload)
+      VALUES($1,'social-manager','SCHEDULE_READY_CONTENT',$2,$3::jsonb)
+    `,[run.id,sequence++,JSON.stringify({...sharedPayload,count:scheduleCount,lead_days:policy.lead_days})]);
+  }
+  const status = sequence === 1 ? 'NO_ACTION' : 'ORDERS_PENDING';
+  run = (await query(`UPDATE content_supply_runs SET status=$2,inventory_snapshot=$3::jsonb,decision=$4::jsonb,updated_at=now() WHERE id=$1 RETURNING *`,[
+    run.id,status,JSON.stringify(inventory),JSON.stringify(decision)
+  ]))[0];
+  return {...await getContentSupplyRun(run.id),created:true};
+}
+
+async function claimContentSupplyOrder(input) {
+  const params = [input.actor,input.claimed_by];
+  const runFilter = input.run_id ? `AND candidate.run_id=$3` : '';
+  if (input.run_id) params.push(input.run_id);
+  const rows = await query(`
+    WITH candidate AS (
+      SELECT candidate.id,candidate.run_id
+      FROM content_supply_orders candidate
+      LEFT JOIN content_supply_orders dependency ON dependency.id=candidate.depends_on
+      WHERE candidate.actor=$1 AND candidate.status='PENDING'
+        AND (candidate.depends_on IS NULL OR dependency.status='COMPLETED') ${runFilter}
+      ORDER BY candidate.created_at,candidate.sequence
+      LIMIT 1 FOR UPDATE OF candidate SKIP LOCKED
+    )
+    UPDATE content_supply_orders target
+    SET status='CLAIMED',claimed_by=$2,claimed_at=now(),updated_at=now()
+    FROM candidate WHERE target.id=candidate.id RETURNING target.*
+  `,params);
+  return {order:rows[0] ?? null,run:rows[0] ? (await getContentSupplyRun(rows[0].run_id)).run : null};
+}
+
+async function completeContentSupplyOrder(input) {
+  const order = (await query('SELECT * FROM content_supply_orders WHERE id=$1',[input.order_id]))[0];
+  if (!order) throw new Error('CONTENT_SUPPLY_ORDER_NOT_FOUND');
+  if (order.status === 'COMPLETED') return getContentSupplyRun(order.run_id);
+  if (!['PENDING','CLAIMED'].includes(order.status)) throw new Error(`CONTENT_SUPPLY_ORDER_NOT_COMPLETABLE: ${order.status}`);
+  if (order.actor !== input.actor) throw new Error('CONTENT_SUPPLY_ORDER_ACTOR_MISMATCH');
+  if (order.claimed_by && order.claimed_by !== input.completed_by) throw new Error('CONTENT_SUPPLY_ORDER_CLAIM_IDENTITY_MISMATCH');
+  if (input.status === 'BLOCKED' && (!input.result?.blocker || typeof input.result.blocker !== 'object')) {
+    throw new Error('CONTENT_SUPPLY_BLOCKED_REQUIRES_EXACT_BLOCKER');
+  }
+  await query(`UPDATE content_supply_orders SET status=$2,result=$3::jsonb,completed_at=now(),updated_at=now() WHERE id=$1`,[
+    order.id,input.status,JSON.stringify(input.result ?? {})
+  ]);
+  if (input.status === 'BLOCKED') {
+    await query(`UPDATE content_supply_runs SET status='BLOCKED',decision=decision || $2::jsonb,updated_at=now() WHERE id=$1`,[
+      order.run_id,JSON.stringify({blocker:input.result.blocker,blocked_order_id:order.id})
+    ]);
+  } else {
+    const counts = (await query(`SELECT
+      count(*) FILTER(WHERE status IN ('PENDING','CLAIMED'))::int AS open,
+      count(*) FILTER(WHERE status='BLOCKED')::int AS blocked
+      FROM content_supply_orders WHERE run_id=$1`,[order.run_id]))[0];
+    const status = counts.blocked > 0 ? 'BLOCKED' : counts.open === 0 ? 'COMPLETE' : 'ORDERS_PENDING';
+    await query('UPDATE content_supply_runs SET status=$2,updated_at=now() WHERE id=$1',[order.run_id,status]);
+  }
+  return getContentSupplyRun(order.run_id);
+}
+
+async function getDailySupplyDigest(input) {
+  const policy = await getContentSupplyPolicy(input);
+  if (!policy) throw new Error('CONTENT_SUPPLY_POLICY_NOT_FOUND');
+  const localDate = zonedClock(policy.timezone).date;
+  let run = (await query(`SELECT * FROM content_supply_runs WHERE policy_id=$1 AND trigger_source='daily' AND local_date=$2`,[
+    policy.id,localDate
+  ]))[0] ?? null;
+  if (!run) return {display:false,reason:'DAILY_TRIGGER_NOT_RUN',local_date:localDate,policy};
+  if (run.shown_at) return {display:false,reason:'ALREADY_SHOWN_TODAY',shown_at:run.shown_at,local_date:localDate};
+  if (input.mark_shown !== false) {
+    run = (await query('UPDATE content_supply_runs SET shown_at=now(),updated_at=now() WHERE id=$1 AND shown_at IS NULL RETURNING *',[run.id]))[0] ?? run;
+  }
+  return {display:true,local_date:localDate,...await getContentSupplyRun(run.id)};
+}
+
+async function runDueContentSupplyPolicies() {
+  const policies = await query('SELECT * FROM content_supply_policies WHERE automation_enabled=true ORDER BY client_slug,campaign,platform');
+  const results = [];
+  for (const policy of policies) {
+    const clock = zonedClock(policy.timezone);
+    if (clock.time < String(policy.daily_trigger_time)) continue;
+    try {
+      const result = await runContentSupply({
+        client_slug:policy.client_slug,campaign:policy.campaign,platform:policy.platform,
+        trigger_source:'daily',requested_by:'content-supply-scheduler'
+      });
+      if (result.created) results.push({policy_id:policy.id,run_id:result.run.id,status:result.run.status});
+    } catch (error) {
+      console.error('Content supply scheduler policy failed',{policy_id:policy.id,error:error.message});
+    }
+  }
+  return {checked:policies.length,created:results.length,runs:results};
 }
 
 async function saveDiscoverySet(input) {
@@ -1074,6 +1388,46 @@ function buildMcpServer(principal) {
     format_mix:z.record(z.any()).optional(), pillar_mix:z.record(z.any()).optional(), preferred_slots:z.array(z.any()).optional(), active:z.boolean().optional()
   },['social.write'],async input => toolResult(await upsertPlan(input)));
 
+  tool('set_content_supply_policy','Create or update the opt-in Agency OS content supply policy for one client account. Automation remains disabled unless automation_enabled is explicitly true.',{
+    client_slug:z.string().regex(/^[a-z0-9-]+$/),campaign:z.string().default('default'),platform:z.string().default('instagram'),
+    automation_enabled:z.boolean().default(false),manual_enabled:z.boolean().default(true),timezone:z.string().default('America/Bogota'),
+    daily_trigger_time:z.string().regex(/^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/).default('09:00'),
+    lead_days:z.number().int().nonnegative().default(3),minimum_ready_items:z.number().int().nonnegative(),
+    target_ready_items:z.number().int().nonnegative(),minimum_scheduled_items:z.number().int().nonnegative(),
+    publication_order:z.array(z.any()).default([]),production_instructions:z.record(z.any()).default({}),
+    research_policy:z.record(z.any()).default({}),owner_approval_required:z.boolean().default(true),created_by:z.string().min(1).max(180)
+  },['social.admin'],async input => toolResult(await upsertContentSupplyPolicy(input)));
+
+  tool('get_content_supply_policy','Get the opt-in content cadence, order, buffer, lead-time and research policy for one client account.',{
+    client_slug:z.string(),campaign:z.string().default('default'),platform:z.string().default('instagram')
+  },['social.read'],async input => toolResult({policy:await getContentSupplyPolicy(input)}));
+
+  tool('run_content_supply','Run the same persisted content supply decision manually or from the daily scheduler. Manual runs require an idempotency key and work only when manual execution is enabled.',{
+    client_slug:z.string(),campaign:z.string().default('default'),platform:z.string().default('instagram'),
+    trigger_source:z.enum(['daily','manual']),idempotency_key:z.string().min(8).max(180).optional(),
+    requested_count:z.number().int().positive().max(100).optional(),requested_by:z.string().min(1).max(180)
+  },['social.write'],async input => toolResult(await runContentSupply(input)));
+
+  tool('run_due_content_supply','Run all due opt-in daily policies now. Daily uniqueness prevents duplicate triggers.',{
+  },['social.admin'],async () => toolResult(await runDueContentSupplyPolicies()));
+
+  tool('get_content_supply_run','Get one supply run with exact policy and ordered actor work.',{
+    run_id:z.string().uuid()
+  },['social.read'],async ({run_id}) => toolResult(await getContentSupplyRun(run_id)));
+
+  tool('claim_content_supply_order','Claim the next dependency-ready supply order for Autopilot, Director or Social Manager.',{
+    actor:z.enum(['autopilot','director','social-manager']),claimed_by:z.string().min(1).max(180),run_id:z.string().uuid().optional()
+  },['social.write'],async input => toolResult(await claimContentSupplyOrder(input)));
+
+  tool('complete_content_supply_order','Persist real execution evidence for one supply order. BLOCKED requires an exact blocker.',{
+    order_id:z.string().uuid(),actor:z.enum(['autopilot','director','social-manager']),completed_by:z.string().min(1).max(180),
+    status:z.enum(['COMPLETED','BLOCKED']),result:z.record(z.any()).default({})
+  },['social.write'],async input => toolResult(await completeContentSupplyOrder(input)));
+
+  tool('get_daily_supply_digest','Return today\'s daily supply trigger once. Subsequent reads report ALREADY_SHOWN_TODAY.',{
+    client_slug:z.string(),campaign:z.string().default('default'),platform:z.string().default('instagram'),mark_shown:z.boolean().default(true)
+  },['social.read'],async input => toolResult(await getDailySupplyDigest(input)));
+
   tool('create_content_item','Register an idea or production item in the persistent editorial pipeline',{
     client_slug:z.string(),item_id:z.string().min(1).max(180),content_version:z.number().int().positive().default(1),
     root_item_id:z.string().min(1).max(180).optional(),parent_item_id:z.string().min(1).max(180).optional(),
@@ -1235,6 +1589,16 @@ const port = Number(process.env.PORT ?? 3000);
 validateAuthConfiguration();
 ensureDiscoverySchema()
   .then(() => ensureAutomationSchema())
-  .then(() => app.listen(port, () => console.log(`Oneforall Social Manager ${VERSION} listening on ${port}`)))
+  .then(() => ensureSupplySchema())
+  .then(() => app.listen(port, () => {
+    console.log(`Oneforall Social Manager ${VERSION} listening on ${port}`);
+    if (SUPPLY_SCHEDULER_ENABLED) {
+      runDueContentSupplyPolicies().catch(error => console.error('Initial content supply scheduler failed',error));
+      const timer = setInterval(() => {
+        runDueContentSupplyPolicies().catch(error => console.error('Content supply scheduler failed',error));
+      },SUPPLY_SCHEDULER_INTERVAL_MS);
+      timer.unref();
+    }
+  }))
   .catch(error => { console.error('Database schema initialization failed', error); process.exit(1); });
 
