@@ -41,3 +41,11 @@ test("Story migration expands only the post format constraint",async()=>{
   assert.doesNotMatch(sql,/DROP TABLE|DELETE FROM|TRUNCATE/i);
 });
 
+test("publish reconciliation migration preserves operations and gates retries",async()=>{
+  const sql=await readFile(new URL("../../migrations/011_publish_reconciliation.sql",import.meta.url),"utf8");
+  assert.match(sql,/ADD COLUMN IF NOT EXISTS container_id text/);
+  assert.match(sql,/ADD COLUMN IF NOT EXISTS reconciled_at timestamptz/);
+  assert.match(sql,/retry_authorized/);
+  assert.doesNotMatch(sql,/DROP TABLE|DELETE FROM|TRUNCATE/i);
+});
+

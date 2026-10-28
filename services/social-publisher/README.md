@@ -1,6 +1,12 @@
-# Oneforall Social Publisher 0.9.0
+# Oneforall Social Publisher 0.10.1
 
 Multi-client Instagram publishing MCP for ChatGPT/Work with Meta OAuth, Cloudflare R2 storage, scheduling, account routing and audit logs.
+
+## Safe publish reconciliation in 0.10.1
+- Publisher persists the Instagram container ID before polling so processing failures remain diagnosable.
+- Meta error codes, subcodes, user-facing details and trace IDs are retained without exposing access tokens.
+- `reconcile_failed_publish_operation` authorizes one audited retry only after backend evidence confirms that a failed operation created no platform media.
+- A retry preserves the ITEM_ID, content version, destination, approval, OWNER_OVERRIDE and idempotency history while incrementing the attempt counter.
 
 ## Instagram Stories in 0.10.0
 - `save_content_item`, `create_post_draft` and `schedule_post` accept `format=story` with exactly one image or video asset.

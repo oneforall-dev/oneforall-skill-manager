@@ -2,7 +2,7 @@ import { createServer } from "node:http";
 import { McpServer } from "@modelcontextprotocol/server";
 import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
 import * as z from "zod";
-import { approveContentItem,createClient,listClients,upsertInstagramAccount,listAccounts,getAccount,getDefaultAccount,registerAsset,listAssets,getPost,getContentItem,saveContentItem,updateContentItemCaption,listContentItems,getContentItemPostId,listScheduled,cancelScheduled,listPublishLogs,scheduleExistingPost,registerAuditReceipt,registerOwnerOverride } from "./repository.js";
+import { approveContentItem,createClient,listClients,upsertInstagramAccount,listAccounts,getAccount,getDefaultAccount,registerAsset,listAssets,getPost,getContentItem,saveContentItem,updateContentItemCaption,listContentItems,getContentItemPostId,listScheduled,cancelScheduled,listPublishLogs,scheduleExistingPost,registerAuditReceipt,registerOwnerOverride,reconcileFailedPublishOperation } from "./repository.js";
 import { getProfile } from "./instagram.js";
 import { publishPost } from "./publisher.js";
 import { startScheduler,stopScheduler } from "./scheduler.js";
@@ -11,8 +11,8 @@ import { createAssetUpload, finalizeAssetUpload, importAssetFromUrl, registerLeg
 import { checkDatabaseReady, pool } from "./db.js";
 import { createWatchdog } from "./watchdog.js";
 
-const VERSION="0.10.0";
-const FEATURES=['multi-client','explicit-account-routing','oauth','r2','chatgpt-file-upload','chatgpt-file-idempotency','jpeg-normalization','legacy-chat-migration','persistent-content-items','versioned-approval','authenticated-audit-receipts','owner-override','audit-execution-timeout','legacy-audit-grandfathering','durable-publish-operations','duplicate-publication-guard','ambiguous-outcome-reconciliation','structured-publish-results','trial-reels','trial-reels-no-silent-fallback','instagram-stories-image-video','actor-header','handoff-protocol-v1','automatic-handoff-continuation','specialist-boundaries','complete-post-publish-handoff','carousel-image-media-type','scheduler','scheduler-failure-recovery','database-readiness','database-timeouts','database-watchdog'];
+const VERSION="0.10.1";
+const FEATURES=['multi-client','explicit-account-routing','oauth','r2','chatgpt-file-upload','chatgpt-file-idempotency','jpeg-normalization','legacy-chat-migration','persistent-content-items','versioned-approval','authenticated-audit-receipts','owner-override','audit-execution-timeout','legacy-audit-grandfathering','durable-publish-operations','duplicate-publication-guard','ambiguous-outcome-reconciliation','safe-failed-publish-retry','instagram-container-evidence','structured-publish-results','trial-reels','trial-reels-no-silent-fallback','instagram-stories-image-video','actor-header','handoff-protocol-v1','automatic-handoff-continuation','specialist-boundaries','complete-post-publish-handoff','carousel-image-media-type','scheduler','scheduler-failure-recovery','database-readiness','database-timeouts','database-watchdog'];
 
 function txt(v:any){
   const outcome=v?.workflow_outcome||(v?.status==='PUBLISH_FAILED'?'BLOCKED':'DONE');
@@ -108,6 +108,7 @@ function createMcp(){
   mcp.registerTool("list_scheduled_posts",{description:"List scheduled posts, optionally filtered by client.",inputSchema:z.object({client_slug:z.string().optional(),limit:z.number().int().min(1).max(100).default(50)})},async a=>txt(await listScheduled(a.client_slug,a.limit)));
   mcp.registerTool("cancel_scheduled_post",{description:"Cancel a draft or scheduled post before publication. Requires explicit confirmation because it changes persisted execution state.",inputSchema:z.object({post_id:z.string().uuid(),confirm:z.boolean().default(false)})},async a=>{mustConfirm(a.confirm);return txt(await cancelScheduled(a.post_id));});
   mcp.registerTool("get_publish_logs",{description:"Get audit logs for a post.",inputSchema:z.object({post_id:z.string().uuid(),limit:z.number().int().min(1).max(200).default(100)})},async a=>txt(await listPublishLogs(a.post_id,a.limit)));
+  mcp.registerTool("reconcile_failed_publish_operation",{description:"Authorize one safe retry only after backend evidence confirms a failed operation did not create platform media. Preserves ITEM_ID, version, destination, approval and audit history. This does not publish by itself.",inputSchema:z.object({operation_id:z.string().uuid(),reconciled_by:z.string().min(1).max(180),evidence_note:z.string().min(20).max(1800),confirm:z.boolean().default(false)})},async a=>{mustConfirm(a.confirm);return txt(await reconcileFailedPublishOperation({operationId:a.operation_id,reconciledBy:a.reconciled_by,evidenceNote:a.evidence_note}));});
   return mcp;
 }
 

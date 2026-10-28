@@ -3,7 +3,7 @@ export type IgCredentials = { instagramUserId: string; accessToken: string };
 export type TrialReelGraduationStrategy = "MANUAL" | "SS_PERFORMANCE";
 export type StoryMediaKind = "image" | "video";
 
-type GraphError = { error?: { message?: string; type?: string; code?: number; error_subcode?: number } };
+type GraphError = { error?: { message?: string; type?: string; code?: number; error_subcode?: number; error_user_title?:string; error_user_msg?:string; fbtrace_id?:string } };
 export class InstagramApiError extends Error {
   readonly status?:number;
   readonly publicationOutcome:"safe"|"unknown";
@@ -11,7 +11,7 @@ export class InstagramApiError extends Error {
     super(message);this.name="InstagramApiError";this.status=args.status;this.publicationOutcome=args.publicationOutcome||"safe";
   }
 }
-type PublishHooks={beforePublish?:()=>Promise<void>|void};
+type PublishHooks={afterContainerCreated?:(containerId:string)=>Promise<void>|void;beforePublish?:()=>Promise<void>|void};
 const base = () => process.env.META_GRAPH_BASE || "https://graph.instagram.com";
 const version = () => process.env.META_GRAPH_VERSION || "v24.0";
 
@@ -27,7 +27,8 @@ async function graph<T>(creds: IgCredentials, path: string, method: "GET" | "POS
   catch(error:any){throw new InstagramApiError(`Instagram API returned an unreadable response (${r.status})`,{status:r.status,publicationOutcome:stage==='publish'&&r.ok?'unknown':'safe'});}
   if(!r.ok||body.error){
     const ambiguous=stage==='publish'&&(r.status===429||r.status>=500);
-    throw new InstagramApiError(body.error?.message||`Instagram API error ${r.status}`,{status:r.status,publicationOutcome:ambiguous?'unknown':'safe'});
+    const detail=[body.error?.message,body.error?.error_user_title,body.error?.error_user_msg,body.error?.code!==undefined?`code=${body.error.code}`:undefined,body.error?.error_subcode!==undefined?`subcode=${body.error.error_subcode}`:undefined,body.error?.fbtrace_id?`trace=${body.error.fbtrace_id}`:undefined].filter(Boolean).join(" | ");
+    throw new InstagramApiError(detail||`Instagram API error ${r.status}`,{status:r.status,publicationOutcome:ambiguous?'unknown':'safe'});
   }
   return body;
 }
@@ -79,7 +80,7 @@ export async function waitForContainer(creds: IgCredentials, containerId: string
   while (Date.now() - started < timeoutMs) {
     const s = await getContainerStatus(creds, containerId);
     if (s.status_code === "FINISHED") return s;
-    if (s.status_code === "ERROR" || s.status_code === "EXPIRED") throw new Error(s.status || `Container ${s.status_code}`);
+    if (s.status_code === "ERROR" || s.status_code === "EXPIRED") throw new InstagramApiError(`Instagram container ${containerId} ${s.status_code}: ${s.status||"no detailed status returned"}`);
     await new Promise(r => setTimeout(r, 4000));
   }
   throw new Error("Timed out waiting for Instagram media processing");
@@ -89,6 +90,7 @@ export async function publishContainer(creds: IgCredentials, containerId: string
 }
 export async function publishImage(creds: IgCredentials, imageUrl: string, caption?: string,hooks:PublishHooks={}) {
   const c = await createImageContainer(creds, imageUrl, caption, false);
+  await hooks.afterContainerCreated?.(c.id);
   await waitForContainer(creds, c.id);
   await hooks.beforePublish?.();
   return publishContainer(creds, c.id);
@@ -106,18 +108,21 @@ export async function publishCarousel(creds: IgCredentials, imageUrls: string[],
     }
   }
   const parent = await createCarouselContainer(creds, children, caption);
+  await hooks.afterContainerCreated?.(parent.id);
   await waitForContainer(creds, parent.id);
   await hooks.beforePublish?.();
   return publishContainer(creds, parent.id);
 }
 export async function publishReel(creds: IgCredentials, videoUrl: string, caption?: string, shareToFeed = true, coverUrl?: string,trialGraduationStrategy?:TrialReelGraduationStrategy,hooks:PublishHooks={}) {
   const c = await createReelContainer(creds, videoUrl, caption, shareToFeed, coverUrl,trialGraduationStrategy);
+  await hooks.afterContainerCreated?.(c.id);
   await waitForContainer(creds, c.id);
   await hooks.beforePublish?.();
   return publishContainer(creds, c.id);
 }
 export async function publishStory(creds: IgCredentials, mediaUrl: string, kind: StoryMediaKind,hooks:PublishHooks={}) {
   const c = await createStoryContainer(creds,mediaUrl,kind);
+  await hooks.afterContainerCreated?.(c.id);
   await waitForContainer(creds,c.id);
   await hooks.beforePublish?.();
   return publishContainer(creds,c.id);

@@ -332,11 +332,39 @@ export async function claimPublishOperation(post:any) {
     if(!inserted.rowCount){
       const existing=(await c.query(`SELECT * FROM publish_operations WHERE idempotency_key=$1 FOR UPDATE`,[key])).rows[0];
       if(existing?.status==='succeeded') return {state:'published' as const,media_id:existing.external_media_id,operation:existing};
+      if(existing?.status==='retry_authorized'){
+        const retried=(await c.query(`UPDATE publish_operations SET status='claimed',attempt=attempt+1,last_error=NULL,container_id=NULL,updated_at=now() WHERE id=$1 AND status='retry_authorized' RETURNING *`,[existing.id])).rows[0];
+        const claimed=await c.query(`UPDATE posts SET status='publishing',last_error=NULL,updated_at=now() WHERE id=$1 AND content_version=$2 AND status='failed' RETURNING id`,[post.id,post.content_version]);
+        if(!claimed.rowCount) throw new Error(`BLOCKED_PENDING_RECONCILIATION: reconciled post is not in failed state`);
+        return {state:'claimed' as const,operation:retried,idempotency_key:key};
+      }
       throw new Error(`BLOCKED_PENDING_RECONCILIATION: publication operation ${key} is ${existing?.status||'unresolved'}; inspect platform evidence before retrying`);
     }
     const claimed=await c.query(`UPDATE posts SET status='publishing',last_error=NULL,updated_at=now() WHERE id=$1 AND content_version=$2 AND status IN ('draft','scheduled','failed') RETURNING id`,[post.id,post.content_version]);
     if(!claimed.rowCount) throw new Error(`BLOCKED_PENDING_RECONCILIATION: post is ${current.status}; publication claim was not executed`);
     return {state:'claimed' as const,operation:inserted.rows[0],idempotency_key:key};
+  });
+}
+
+export async function markPublishContainer(operationId:string,containerId:string) {
+  const q=await pool.query(`UPDATE publish_operations SET container_id=$2,updated_at=now() WHERE id=$1 AND status='claimed' RETURNING *`,[operationId,containerId]);
+  if(!q.rowCount) throw new Error("Publication operation cannot record its Instagram container");
+  return q.rows[0];
+}
+
+export async function reconcileFailedPublishOperation(args:{operationId:string;reconciledBy:string;evidenceNote:string}) {
+  return withTx(async c=>{
+    const row=(await c.query(`SELECT o.*,p.status AS post_status,p.content_version AS current_content_version,p.instagram_account_id AS current_account_id,p.item_id
+      FROM publish_operations o JOIN posts p ON p.id=o.post_id WHERE o.id=$1 FOR UPDATE OF o,p`,[args.operationId])).rows[0];
+    if(!row) throw new Error("Publication operation not found");
+    if(row.status!=='failed') throw new Error(`RECONCILIATION_BLOCKED: operation is ${row.status}, expected failed`);
+    if(row.external_media_id) throw new Error("RECONCILIATION_BLOCKED: operation already has external media evidence");
+    if(row.post_status!=='failed') throw new Error(`RECONCILIATION_BLOCKED: post is ${row.post_status}, expected failed`);
+    if(row.content_version!==row.current_content_version||row.instagram_account_id!==row.current_account_id) throw new Error("RECONCILIATION_BLOCKED: content version or destination changed");
+    const note=`${args.reconciledBy}: ${args.evidenceNote}`.slice(0,2000);
+    const operation=(await c.query(`UPDATE publish_operations SET status='retry_authorized',reconciled_at=now(),reconciliation_note=$2,updated_at=now() WHERE id=$1 RETURNING *`,[args.operationId,note])).rows[0];
+    await c.query(`INSERT INTO publish_logs(post_id,instagram_account_id,event,detail) VALUES($1,$2,'reconciled_retry_authorized',$3)`,[row.post_id,row.instagram_account_id,{operation_id:row.id,previous_error:row.last_error,reconciled_by:args.reconciledBy,evidence_note:args.evidenceNote}]);
+    return {workflow_outcome:'DONE',status:'RETRY_AUTHORIZED',operation_id:row.id,post_id:row.post_id,item_id:row.item_id,attempt:Number(row.attempt)+1,reconciled_at:operation.reconciled_at};
   });
 }
 
