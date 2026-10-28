@@ -2,6 +2,12 @@
 
 Multi-client Instagram publishing MCP for ChatGPT/Work with Meta OAuth, Cloudflare R2 storage, scheduling, account routing and audit logs.
 
+## Instagram Stories in 0.10.0
+- `save_content_item`, `create_post_draft` and `schedule_post` accept `format=story` with exactly one image or video asset.
+- Publisher creates the Meta container with `media_type=STORIES`, waits for processing and uses the same durable `media_publish` guard as other formats.
+- Stories reject captions and `cover_url`; render any text into the image or video itself so the approved payload matches what Instagram displays.
+- Story publication participates in the existing content hash, approval, Auditor/OWNER_OVERRIDE, idempotency, scheduling and post-publish handoff flows.
+
 ## Trial Reels in 0.9.0
 - `save_content_item`, `create_post_draft` and `schedule_post` accept `trial_reel=true` only when `format=reel`.
 - Trial Reels require `trial_graduation_strategy=MANUAL` or `SS_PERFORMANCE` and send it to Meta as `trial_params` on container creation.
@@ -39,7 +45,7 @@ Multi-client Instagram publishing MCP for ChatGPT/Work with Meta OAuth, Cloudfla
 - Presigned 15-minute PUT uploads (`create_asset_upload` → `finalize_asset_upload`).
 - Server-side copy of retrievable generated/external assets into R2 (`import_asset_from_url`).
 - R2 object verification with `HeadObject` before asset registration.
-- Existing V2 multi-client drafts, immediate publish, scheduler, logs, image/carousel/Reel flows.
+- Existing V2 multi-client drafts, immediate publish, scheduler, logs, image/carousel/Reel/Story flows.
 
 ## Core flow
 1. `create_client`

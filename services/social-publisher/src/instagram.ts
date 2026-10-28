@@ -1,6 +1,7 @@
 export type PublishResult = { id: string };
 export type IgCredentials = { instagramUserId: string; accessToken: string };
 export type TrialReelGraduationStrategy = "MANUAL" | "SS_PERFORMANCE";
+export type StoryMediaKind = "image" | "video";
 
 type GraphError = { error?: { message?: string; type?: string; code?: number; error_subcode?: number } };
 export class InstagramApiError extends Error {
@@ -60,6 +61,16 @@ export async function createReelContainer(creds: IgCredentials, videoUrl: string
   if(trialGraduationStrategy&&process.env.INSTAGRAM_TRIAL_REELS_ENABLED==="false") throw new Error("TRIAL_REELS_DISABLED: server capability flag is off");
   return graph<{id:string}>(creds, `${creds.instagramUserId}/media`, "POST", reelContainerParams(videoUrl,caption,shareToFeed,coverUrl,trialGraduationStrategy));
 }
+export function storyContainerParams(mediaUrl: string, kind: StoryMediaKind) {
+  return {
+    media_type:"STORIES",
+    image_url:kind==="image"?mediaUrl:undefined,
+    video_url:kind==="video"?mediaUrl:undefined
+  };
+}
+export async function createStoryContainer(creds: IgCredentials, mediaUrl: string, kind: StoryMediaKind) {
+  return graph<{id:string}>(creds, `${creds.instagramUserId}/media`, "POST", storyContainerParams(mediaUrl,kind));
+}
 export async function getContainerStatus(creds: IgCredentials, containerId: string) {
   return graph<{id:string;status_code?:string;status?:string}>(creds, `${containerId}?fields=id,status_code,status`, "GET");
 }
@@ -104,4 +115,10 @@ export async function publishReel(creds: IgCredentials, videoUrl: string, captio
   await waitForContainer(creds, c.id);
   await hooks.beforePublish?.();
   return publishContainer(creds, c.id);
+}
+export async function publishStory(creds: IgCredentials, mediaUrl: string, kind: StoryMediaKind,hooks:PublishHooks={}) {
+  const c = await createStoryContainer(creds,mediaUrl,kind);
+  await waitForContainer(creds,c.id);
+  await hooks.beforePublish?.();
+  return publishContainer(creds,c.id);
 }

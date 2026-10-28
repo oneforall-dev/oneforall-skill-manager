@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
-import { publishImage, publishReel } from "../../dist/instagram.js";
+import { publishImage, publishReel, publishStory } from "../../dist/instagram.js";
 
 async function listen(handler){const server=createServer(handler);server.listen(0,"127.0.0.1");await once(server,"listening");const address=server.address();return {server,url:`http://127.0.0.1:${address.port}`};}
 
@@ -29,6 +29,21 @@ test("Instagram mock publishes once and marks platform_pending before media_publ
   const result=await publishImage({instagramUserId:"ig-user",accessToken:"token"},"https://example.invalid/image.jpg","caption",{beforePublish:()=>{pending=true;}});
   assert.equal(result.id,"media-123");
   assert.equal(publishCalls,1);
+});
+
+for(const story of [
+  {kind:"image",url:"https://example.invalid/story.jpg",urlParam:"image_url"},
+  {kind:"video",url:"https://example.invalid/story.mp4",urlParam:"video_url"}
+]) test(`Instagram mock publishes a ${story.kind} Story with media_type=STORIES`,async t=>{
+  let pending=false;let createParams;
+  const mock=await listen((req,res)=>{const url=new URL(req.url,"http://localhost");res.setHeader("content-type","application/json");if(url.pathname.endsWith("/media_publish")){assert.equal(pending,true);res.end(JSON.stringify({id:`story-${story.kind}-media`}));return;}if(req.method==="GET"){res.end(JSON.stringify({id:"story-container",status_code:"FINISHED"}));return;}createParams=url.searchParams;res.end(JSON.stringify({id:"story-container"}));});
+  t.after(()=>mock.server.close());
+  process.env.META_GRAPH_BASE=mock.url;process.env.META_GRAPH_VERSION="v24.0";
+  const result=await publishStory({instagramUserId:"ig-user",accessToken:"token"},story.url,story.kind,{beforePublish:()=>{pending=true;}});
+  assert.equal(result.id,`story-${story.kind}-media`);
+  assert.equal(createParams.get("media_type"),"STORIES");
+  assert.equal(createParams.get(story.urlParam),story.url);
+  assert.equal(createParams.has(story.kind==="image"?"video_url":"image_url"),false);
 });
 
 test("ambiguous media_publish failures are marked unknown",async t=>{

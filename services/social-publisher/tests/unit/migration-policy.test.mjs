@@ -33,3 +33,11 @@ test("Trial Reel migration is additive and constrains strategy to Reel content",
   assert.doesNotMatch(sql,/UPDATE posts SET/);
 });
 
+test("Story migration expands only the post format constraint",async()=>{
+  const sql=await readFile(new URL("../../migrations/010_instagram_stories.sql",import.meta.url),"utf8");
+  assert.match(sql,/DROP CONSTRAINT IF EXISTS posts_format_check/);
+  assert.match(sql,/format IN \('image','carousel','reel','story'\)/);
+  assert.doesNotMatch(sql,/UPDATE posts SET/);
+  assert.doesNotMatch(sql,/DROP TABLE|DELETE FROM|TRUNCATE/i);
+});
+

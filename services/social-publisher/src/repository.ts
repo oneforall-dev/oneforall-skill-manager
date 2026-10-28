@@ -7,7 +7,7 @@ import { loadAuditVerifierConfig, verifyAuditReceipt, type AuditReceiptPayload }
 import { publicationIdempotencyKey } from "./publication-safety.js";
 import { auditExecutionState, ownerOverrideKey, ownerOverrideMatches, type PublicationAction } from "./authorization.js";
 
-type ContentFormat = "image"|"carousel"|"reel";
+type ContentFormat = "image"|"carousel"|"reel"|"story";
 type ContentSnapshot = {
   clientId:string;
   accountId:string;
@@ -51,13 +51,17 @@ async function validateContent(c:any,args:ContentInput) {
   if(args.format==='image' && args.assetIds.length!==1) throw new Error("Image post requires exactly 1 asset");
   if(args.format==='carousel' && (args.assetIds.length<2||args.assetIds.length>10)) throw new Error("Carousel requires 2-10 assets");
   if(args.format==='reel' && args.assetIds.length!==1) throw new Error("Reel requires exactly 1 video asset");
+  if(args.format==='story' && args.assetIds.length!==1) throw new Error("Story requires exactly 1 image or video asset");
+  if(args.format==='story' && args.caption?.trim()) throw new Error("Instagram Stories do not support captions; render text into the asset instead");
+  if(args.format==='story' && args.coverUrl) throw new Error("cover_url is not valid for Stories");
   if(args.trialReel&&args.format!=='reel') throw new Error("Trial mode is only valid for Reels");
   if(args.trialReel&&!args.trialGraduationStrategy) throw new Error("Trial Reel requires trial_graduation_strategy");
   if(!args.trialReel&&args.trialGraduationStrategy) throw new Error("trial_graduation_strategy requires trial_reel=true");
   const assets=await c.query(`SELECT id,kind FROM assets WHERE client_id=$1 AND id=ANY($2::uuid[])`,[clientId,args.assetIds]);
   if(assets.rowCount!==args.assetIds.length) throw new Error("One or more assets do not belong to this client");
   if(args.format==='reel' && assets.rows[0].kind!=='video') throw new Error("Reel asset must be video");
-  if(args.format!=='reel' && assets.rows.some((a:any)=>a.kind!=='image')) throw new Error("Image/carousel assets must be images");
+  if((args.format==='image'||args.format==='carousel') && assets.rows.some((a:any)=>a.kind!=='image')) throw new Error("Image/carousel assets must be images");
+  if(args.format==='story' && !['image','video'].includes(assets.rows[0].kind)) throw new Error("Story asset must be an image or video");
   return {
     clientId,
     accountId:accountId!,

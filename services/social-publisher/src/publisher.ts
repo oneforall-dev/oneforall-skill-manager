@@ -1,6 +1,6 @@
 import { pool } from "./db.js";
 import { assertCurrentPublicationAuthorization, claimPublishOperation, getAccount, getPost, hashPostContent, logPublish, markPublishFailed, markPublishPending, markPublishSucceeded, markPublishUnknown } from "./repository.js";
-import { publishCarousel, publishImage, publishReel } from "./instagram.js";
+import { publishCarousel, publishImage, publishReel, publishStory } from "./instagram.js";
 import { ensureInstagramImageAsset } from "./storage.js";
 import { publishErrorDisposition, sanitizedError } from "./publication-safety.js";
 
@@ -46,11 +46,14 @@ export async function publishPost(postId:string) {
   let mediaId:string|undefined;
   try {
     let result:{id:string};
-    const assets=post.format==='reel'?post.assets:await Promise.all(post.assets.map((asset:any)=>ensureInstagramImageAsset(asset)));
+    const storyKind=post.format==='story'?post.assets[0]?.kind:undefined;
+    const usesVideo=post.format==='reel'||(post.format==='story'&&storyKind==='video');
+    const assets=usesVideo?post.assets:await Promise.all(post.assets.map((asset:any)=>ensureInstagramImageAsset(asset)));
     const hooks={beforePublish:()=>markPublishPending(operationId).then(()=>undefined)};
     if(post.format==='image') result=await publishImage(account.credentials,assets[0].public_url,post.caption||undefined,hooks);
     else if(post.format==='carousel') result=await publishCarousel(account.credentials,assets.map((a:any)=>a.public_url),post.caption||undefined,hooks);
-    else result=await publishReel(account.credentials,post.assets[0].public_url,post.caption||undefined,post.share_to_feed,post.cover_url||undefined,post.trial_reel?post.trial_graduation_strategy:undefined,hooks);
+    else if(post.format==='reel') result=await publishReel(account.credentials,post.assets[0].public_url,post.caption||undefined,post.share_to_feed,post.cover_url||undefined,post.trial_reel?post.trial_graduation_strategy:undefined,hooks);
+    else result=await publishStory(account.credentials,assets[0].public_url,storyKind,hooks);
     mediaId=result.id;
     const committed=await markPublishSucceeded({operationId,postId,mediaId});
     await logPublish(postId,account.id,'published',{media_id:mediaId,operation_id:operationId,idempotency_key:claim.idempotency_key}).catch(error=>console.error('published audit log write failed',postId,error));
