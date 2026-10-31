@@ -16,3 +16,21 @@ test("scheduler does not spin on the same blocked row",async()=>{
   assert.equal(claims,2);
 });
 
+test("scheduler continues after onError removes a blocked row",async()=>{
+  const queue=["blocked-post","next-post"];const published=[];const errors=[];
+  await runSchedulerPass({
+    claim:async()=>queue[0]||null,
+    publish:async id=>{
+      if(id==="blocked-post") throw new Error("AUDITOR_NOT_EXECUTED");
+      published.push(id);
+      queue.shift();
+      return {status:"PUBLISHED"};
+    },
+    onError:async(id,error)=>{
+      errors.push([id,String(error.message)]);
+      queue.shift();
+    }
+  });
+  assert.deepEqual(errors,[["blocked-post","AUDITOR_NOT_EXECUTED"]]);
+  assert.deepEqual(published,["next-post"]);
+});

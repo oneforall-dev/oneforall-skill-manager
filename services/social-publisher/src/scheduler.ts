@@ -14,9 +14,11 @@ async function claimDuePost():Promise<string|null>{
 
 const schedulerDependencies={claim:claimDuePost,publish:publishPost,onError:async(id:string,error:unknown)=>{
   const message=String((error as any)?.message||error);
-  const blocked=message.startsWith('BLOCKED_PENDING_RECONCILIATION')||message.startsWith('AUDIT_REQUIRED');
+  const reconciliationBlocked=message.startsWith('BLOCKED_PENDING_RECONCILIATION');
+  const policyBlocked=message.startsWith('AUDIT_')||message.startsWith('AUDITOR_');
+  const blocked=reconciliationBlocked||policyBlocked;
   await pool.query(`INSERT INTO publish_logs(post_id,instagram_account_id,event,detail) SELECT id,instagram_account_id,$2,$3::jsonb FROM posts WHERE id=$1`,[id,blocked?'blocked':'failed',JSON.stringify({error:message,source:'scheduler-preflight'})]).catch(()=>undefined);
-  if(!blocked) await pool.query(`UPDATE posts SET status='failed',last_error=$2,updated_at=now() WHERE id=$1 AND status='publishing'`,[id,message]).catch(()=>undefined);
+  if(!reconciliationBlocked) await pool.query(`UPDATE posts SET status='failed',last_error=$2,updated_at=now() WHERE id=$1 AND status IN ('scheduled','publishing')`,[id,message]).catch(()=>undefined);
   console.error('scheduled publish blocked',id,message);
 }};
 
